@@ -962,6 +962,9 @@ class DiffusionModelConfig(BaseModel):
         if args and args.guardrail_checkpoint_dir:
             extra_attrs["guardrail_checkpoint_dir"] = args.guardrail_checkpoint_dir
 
+        if args and args.guardrail_checkpoint_dir:
+            extra_attrs["guardrail_checkpoint_dir"] = args.guardrail_checkpoint_dir
+
         # Discover pipeline components (diffusers layout)
         components = discover_pipeline_components(checkpoint_path)
 
