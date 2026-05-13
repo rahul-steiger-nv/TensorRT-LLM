@@ -18,6 +18,7 @@ from .checkpoints import WeightLoader
 from .config import PipelineComponent
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
+from .offloading import ForwardHookOffloadPipeline, OffloadPipelinePart, OffloadPipelineStage
 
 
 class ExtraParamSchema(StrictBaseModel):
@@ -62,6 +63,7 @@ class BasePipeline(nn.Module):
         self.config = model_config.pretrained_config
         self.mapping: Mapping = getattr(model_config, "mapping", None) or Mapping()
         self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
+        self._offload_pipeline: Optional[ForwardHookOffloadPipeline] = None
         self._parallel_vae_enabled: bool = False
         self._warmed_up_shapes: Set[tuple] = set()
 
@@ -309,6 +311,64 @@ class BasePipeline(nn.Module):
     def post_load_weights(self) -> None:
         if self.transformer is not None and hasattr(self.transformer, "post_load_weights"):
             self.transformer.post_load_weights()
+
+    def default_offload_stages(self) -> tuple[OffloadPipelineStage, ...]:
+        """Return model-specific default offload stages for shorthand config."""
+        return ()
+
+    def requested_offload_parts(self) -> set[str]:
+        return {part for stage in self.default_offload_stages() for part in stage}
+
+    def offload_pipeline_part_owners(self) -> tuple[Any, ...]:
+        return tuple(self.modules())
+
+    def collect_offload_pipeline_parts(self) -> dict[str, OffloadPipelinePart]:
+        parts: dict[str, OffloadPipelinePart] = {}
+        for owner in self.offload_pipeline_part_owners():
+            if owner is None:
+                continue
+            get_parts = getattr(owner, "offload_pipeline_parts", None)
+            if callable(get_parts):
+                parts.update(get_parts())
+        return parts
+
+    def _filter_available_offload_stages(
+        self,
+        stages: tuple[OffloadPipelineStage, ...],
+        available_parts: dict[str, OffloadPipelinePart],
+    ) -> tuple[OffloadPipelineStage, ...]:
+        return tuple(
+            tuple(part for part in stage if part in available_parts)
+            for stage in stages
+            if any(part in available_parts for part in stage)
+        )
+
+    def offload_pipeline_device(self, requested_parts: set[str]) -> torch.device:
+        del requested_parts
+        return torch.device(self.device)
+
+    def initialize_offload_pipeline(self) -> None:
+        configured_stages = self.default_offload_stages()
+        if not configured_stages or self._offload_pipeline is not None:
+            return
+
+        available_parts = self.collect_offload_pipeline_parts()
+        stages = self._filter_available_offload_stages(configured_stages, available_parts)
+        if not stages:
+            return
+
+        requested_parts = {part for stage in stages for part in stage}
+        pipeline_config = getattr(self.model_config, "pipeline", None)
+        pin_memory = bool(getattr(pipeline_config, "offload_param_pin_memory", True))
+        stage_summary = " -> ".join("+".join(stage) for stage in stages)
+        logger.info("%s offload pipeline enabled: %s", self.__class__.__name__, stage_summary)
+        self._offload_pipeline = ForwardHookOffloadPipeline(
+            stages=stages,
+            parts=available_parts,
+            device=self.offload_pipeline_device(requested_parts),
+            pin_memory=pin_memory,
+        )
+        self._offload_pipeline.initialize()
 
     def _apply_teacache_coefficients(self, coefficients: Optional[Dict]) -> None:
         """Pick TeaCache coefficients from checkpoint path; updates model_config.teacache in place."""
