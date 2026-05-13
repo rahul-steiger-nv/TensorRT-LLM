@@ -231,6 +231,13 @@ def parse_args():
     )
     parser.add_argument("--disable_parallel_vae", action="store_true", help="Disable parallel VAE")
 
+    # Offloading
+    parser.add_argument(
+        "--enable_offloading",
+        action="store_true",
+        help="Enable Wan T2V text-encoder/transformer-block CPU offloading.",
+    )
+
     # CUDA graph
     parser.add_argument(
         "--enable_cudagraph", action="store_true", help="Enable CudaGraph acceleration"
@@ -342,7 +349,11 @@ def main():
             "enable_autotune": not args.disable_autotune,
         },
         cuda_graph={"enable_cuda_graph": args.enable_cudagraph},
-        pipeline={"enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker},
+        pipeline={
+            "enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker,
+            "enable_offloading": args.enable_offloading,
+            "offload_device": "cpu",
+        },
     )
     quant_config = _linear_type_to_quant_config(args.linear_type)
     if quant_config is not None:

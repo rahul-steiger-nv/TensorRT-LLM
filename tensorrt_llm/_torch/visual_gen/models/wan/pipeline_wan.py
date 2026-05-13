@@ -19,6 +19,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.defaults import (
     get_wan_extra_param_specs,
 )
 from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_utils import retrieve_latents
+from tensorrt_llm._torch.visual_gen.offloading import OffloadPipelinePart
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
@@ -76,6 +77,11 @@ WAN_DEFAULT_NEGATIVE_PROMPT = (
     "still image, overall grayish tone, worst quality, low quality, JPEG compression artifacts, ugly, "
     "incomplete, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, malformed limbs, "
     "fused fingers, motionless image, cluttered background, three legs, many people in the background, walking backward"
+)
+
+_WAN_T2V_OFFLOAD_STAGES = (
+    ("text_encoder",),
+    ("transformer.blocks",),
 )
 
 
@@ -175,6 +181,26 @@ class WanPipeline(BasePipeline):
             logger.info("Creating second transformer for Wan2.2 A14B two-stage denoising...")
             self.transformer_2 = WanTransformer3DModel(model_config=self.model_config)
 
+    def default_offload_stages(self) -> tuple[tuple[str, ...], ...]:
+        pipeline_config = getattr(self.model_config, "pipeline", None)
+        if pipeline_config is None:
+            return ()
+        if self.is_wan22_14b or self.is_wan22_5b:
+            return ()
+
+        if bool(
+            getattr(pipeline_config, "enable_offloading", False)
+            and getattr(pipeline_config, "offload_device", "cpu") == "cpu"
+        ):
+            return _WAN_T2V_OFFLOAD_STAGES
+        return ()
+
+    def offload_pipeline_parts(self) -> dict[str, OffloadPipelinePart]:
+        parts: dict[str, OffloadPipelinePart] = {}
+        if getattr(self, "text_encoder", None) is not None:
+            parts["text_encoder"] = OffloadPipelinePart(self.text_encoder)
+        return parts
+
     def load_standard_components(
         self,
         checkpoint_dir: str,
@@ -212,11 +238,14 @@ class WanPipeline(BasePipeline):
 
         if PipelineComponent.TEXT_ENCODER not in skip_components:
             logger.info("Loading text encoder...")
+            text_encoder_device = (
+                torch.device("cpu") if "text_encoder" in self.requested_offload_parts() else device
+            )
             self.text_encoder = UMT5EncoderModel.from_pretrained(
                 checkpoint_dir,
                 subfolder=PipelineComponent.TEXT_ENCODER,
                 torch_dtype=self.model_config.torch_dtype,
-            ).to(device)
+            ).to(text_encoder_device)
 
         if PipelineComponent.VAE not in skip_components:
             logger.info("Loading VAE...")
