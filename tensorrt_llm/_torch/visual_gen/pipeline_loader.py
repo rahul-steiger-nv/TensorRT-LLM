@@ -189,9 +189,10 @@ class PipelineLoader:
         with MetaInitMode():
             pipeline = AutoPipeline.from_config(config, checkpoint_dir)
 
-        # Convert meta tensors to CUDA tensors
-        self._materialize_meta_tensors(pipeline)
-        pipeline.to(self.device)
+        # Convert meta tensors to their runtime devices. Offloaded submodules
+        # stay on CPU until the forward-hook offload pipeline stages them.
+        cpu_offload_modules = self._get_load_time_cpu_offload_modules(pipeline)
+        self._materialize_meta_tensors(pipeline, cpu_offload_modules)
 
         # =====================================================================
         # STEP 3: Load Transformer Weights
@@ -231,6 +232,7 @@ class PipelineLoader:
 
         if hasattr(pipeline, "post_load_weights"):
             pipeline.post_load_weights()
+        pipeline.initialize_offload_pipeline()
 
         if config.torch_compile.enable_torch_compile:
             torch._dynamo.config.cache_size_limit = 128
@@ -266,20 +268,76 @@ class PipelineLoader:
         )
         return pipeline
 
-    def _materialize_meta_tensors(self, module: torch.nn.Module) -> None:
+    def _get_load_time_cpu_offload_modules(
+        self, module: torch.nn.Module
+    ) -> list[torch.nn.Module]:
+        modules: list[torch.nn.Module] = []
+        seen: set[int] = set()
+
+        for child in module.modules():
+            get_modules = getattr(child, "load_time_cpu_offload_modules", None)
+            if not callable(get_modules):
+                continue
+            for offload_module in get_modules():
+                module_id = id(offload_module)
+                if module_id not in seen:
+                    modules.append(offload_module)
+                    seen.add(module_id)
+
+        return modules
+
+    def _materialize_meta_tensors(
+        self,
+        module: torch.nn.Module,
+        cpu_offload_modules: Optional[list[torch.nn.Module]] = None,
+    ) -> None:
         """
-        Convert meta tensors to CUDA tensors.
+        Convert meta tensors to tensors on their runtime devices.
 
         Meta tensors are placeholders that don't allocate GPU memory.
         After model structure is defined, we materialize them to real tensors.
+        Submodules listed in ``cpu_offload_modules`` are materialized on CPU and
+        skipped by the final move to ``self.device`` so checkpoint loading never
+        needs the full offloaded tower resident on GPU.
         """
-        memo = {}
+        cpu_offload_modules = cpu_offload_modules or []
+        meta_device = torch.device("meta")
+
+        cpu_memo = {}
+
+        def init_cpu_tensor(t: torch.Tensor) -> torch.Tensor:
+            if t.device != meta_device:
+                return t.to("cpu")
+            if t not in cpu_memo:
+                cpu_memo[t] = torch.empty_like(t, device="cpu")
+            return cpu_memo[t]
+
+        for offload_module in cpu_offload_modules:
+            offload_module._apply(init_cpu_tensor)
+
+        cpu_tensor_ids = self._collect_module_tensor_ids(cpu_offload_modules)
+        target_memo = {}
 
         def init_meta_tensor(t: torch.Tensor) -> torch.Tensor:
-            if t.device != torch.device("meta"):
+            if id(t) in cpu_tensor_ids:
                 return t
-            if t not in memo:
-                memo[t] = torch.empty_like(t, device="cuda")
-            return memo[t]
+            if t.device != meta_device:
+                return t.to(self.device)
+            if t not in target_memo:
+                target_memo[t] = torch.empty_like(t, device=self.device)
+            return target_memo[t]
 
         module._apply(init_meta_tensor)
+
+    @staticmethod
+    def _collect_module_tensor_ids(modules: list[torch.nn.Module]) -> set[int]:
+        tensor_ids: set[int] = set()
+        for module in modules:
+            for child in module.modules():
+                for param in child._parameters.values():
+                    if param is not None:
+                        tensor_ids.add(id(param))
+                for buffer in child._buffers.values():
+                    if buffer is not None:
+                        tensor_ids.add(id(buffer))
+        return tensor_ids

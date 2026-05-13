@@ -323,6 +323,7 @@ class DiffusionExecutor:
                     f"torch.compile recompilation or CUDA graph capture. "
                     f"Warmed-up shapes: {self.pipeline._warmed_up_shapes}"
                 )
+            self._reset_cuda_peak_memory_stats()
             # Host wall-clock around pipeline.infer(). The pipeline already
             # syncs at the end (decode_latents path), so this captures the
             # full executor-side envelope including any pre/post-pipeline work
@@ -330,6 +331,7 @@ class DiffusionExecutor:
             generation_start = time.perf_counter()
             output = self.pipeline.infer(req)
             generation = time.perf_counter() - generation_start  # seconds
+            self._log_cuda_peak_memory(req.request_id)
             if self.rank == 0:
                 self.response_queue.put(
                     DiffusionResponse(
@@ -339,12 +341,55 @@ class DiffusionExecutor:
                     )
                 )
         except Exception as e:
+            self._log_cuda_peak_memory(req.request_id)
             logger.error(f"Worker {self.device_id}: Error: {e}")
             logger.error(traceback.format_exc())
             if self.rank == 0:
                 self.response_queue.put(
                     DiffusionResponse(request_id=req.request_id, error_msg=str(e))
                 )
+
+    def _reset_cuda_peak_memory_stats(self) -> None:
+        if not torch.cuda.is_available():
+            return
+
+        try:
+            torch.cuda.synchronize(self.device_id)
+            torch.cuda.reset_peak_memory_stats(self.device_id)
+        except Exception as e:
+            logger.warning(
+                f"Worker {self.device_id} rank {self.rank}: "
+                f"Unable to reset CUDA peak memory stats: {e}"
+            )
+
+    def _log_cuda_peak_memory(self, request_id: int) -> None:
+        if not torch.cuda.is_available():
+            return
+
+        try:
+            torch.cuda.synchronize(self.device_id)
+            peak_allocated = torch.cuda.max_memory_allocated(self.device_id)
+            max_peak_allocated = peak_allocated
+
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                peak_tensor = torch.tensor(
+                    [peak_allocated],
+                    dtype=torch.float64,
+                    device=f"cuda:{self.device_id}",
+                )
+                dist.all_reduce(peak_tensor, op=dist.ReduceOp.MAX)
+                max_peak_allocated = int(peak_tensor.item())
+
+            if self.rank == 0:
+                logger.info(
+                    f"Request {request_id} max peak CUDA memory: "
+                    f"{max_peak_allocated / 2**30:.2f} GiB"
+                )
+        except Exception as e:
+            logger.warning(
+                f"Worker {self.device_id} rank {self.rank}: "
+                f"Unable to log CUDA peak memory for request {request_id}: {e}"
+            )
 
 
 def run_diffusion_worker(

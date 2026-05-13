@@ -108,6 +108,19 @@ python visual_gen_wan_t2v.py \
     --output_path output.mp4
 ```
 
+**With CPU offloading:**
+```bash
+python visual_gen_wan_t2v.py \
+    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+    --prompt "A cute cat playing piano" \
+    --height 480 --width 832 --num_frames 33 \
+    --enable_offloading \
+    --output_path output_offloaded.avi
+```
+
+For Wan text-to-video, CPU offloading stages the text encoder and transformer
+blocks between CPU and GPU to reduce peak GPU memory usage.
+
 ### Multi-GPU Parallelism
 
 WAN supports two parallelism modes that can be combined:
