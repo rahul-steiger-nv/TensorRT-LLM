@@ -374,7 +374,7 @@ class ForwardHookOffloadPipeline:
     def _build_groups(self) -> list[_OffloadGroup]:
         groups: list[_OffloadGroup] = []
         seen_names: set[str] = set()
-        for stage, group_name in zip(self.stages, self._stage_names):
+        for stage, group_name in zip(self.stages, self._stage_names, strict=True):
             if not stage:
                 raise ValueError("Offload pipeline stages must have at least one part")
             if group_name in seen_names:
