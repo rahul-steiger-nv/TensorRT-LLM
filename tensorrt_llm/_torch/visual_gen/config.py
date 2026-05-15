@@ -456,6 +456,20 @@ class PipelineConfig(StrictBaseModel):
     enable_offloading: bool = False
     offload_device: Literal["cpu", "cuda"] = "cpu"
     offload_param_pin_memory: bool = True
+    offload_shared_memory: bool = PydanticField(
+        False,
+        description=(
+            "Share CPU offload storage between distributed visual-generation "
+            "processes. Currently implemented for Cosmos3 transformer offload."
+        ),
+    )
+    offload_shared_memory_path: str = PydanticField(
+        "",
+        description=(
+            "Optional file path for shared CPU offload storage. If empty, "
+            "Cosmos3 chooses a node-local path automatically."
+        ),
+    )
     offload_guardrails: bool = PydanticField(
         False,
         description=(
@@ -1123,6 +1137,8 @@ class DiffusionModelConfig(BaseModel):
             attention=attention_cfg,
             attention_metadata_state=attention_metadata_state,
             parallel=parallel_cfg,
+            enable_parallel_vae=parallel_cfg.enable_parallel_vae,
+            parallel_vae_split_dim=parallel_cfg.parallel_vae_split_dim,
             cache=cache_cfg,
             skip_create_weights_in_init=True,
             extra_attrs=extra_attrs,

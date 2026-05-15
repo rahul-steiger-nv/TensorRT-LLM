@@ -18,7 +18,12 @@ from .checkpoints import WeightLoader
 from .config import PipelineComponent
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
-from .offloading import ForwardHookOffloadPipeline, OffloadPipelinePart, OffloadPipelineStage
+from .offloading import (
+    ForwardHookOffloadPipeline,
+    OffloadPipelinePart,
+    OffloadPipelineStage,
+    SharedOffloadStorageConfig,
+)
 
 
 class ExtraParamSchema(StrictBaseModel):
@@ -378,8 +383,15 @@ class BasePipeline(nn.Module):
                 f"Checkpoint directory must contain a 'transformer' subdirectory."
             )
 
-        weight_loader = WeightLoader(components=transformer_components)
+        weight_loader = WeightLoader(
+            components=transformer_components,
+            skip_prefixes=self.transformer_weight_skip_prefixes(),
+        )
         return weight_loader.load_weights(checkpoint_dir, self.mapping)
+
+    def transformer_weight_skip_prefixes(self) -> tuple[str, ...]:
+        """Checkpoint prefixes to skip while loading transformer weights."""
+        return ()
 
     def load_standard_components(
         self,
@@ -448,6 +460,14 @@ class BasePipeline(nn.Module):
         del requested_parts
         return torch.device(self.device)
 
+    def offload_shared_storage_config(
+        self,
+        stages: tuple[OffloadPipelineStage, ...],
+        requested_parts: set[str],
+    ) -> SharedOffloadStorageConfig | None:
+        del stages, requested_parts
+        return None
+
     def initialize_offload_pipeline(self) -> None:
         configured_stages = self._configured_offload_pipeline_stages()
         if not configured_stages or self._offload_pipeline is not None:
@@ -468,6 +488,7 @@ class BasePipeline(nn.Module):
             parts=available_parts,
             device=self.offload_pipeline_device(requested_parts),
             pin_memory=pin_memory,
+            shared_storage=self.offload_shared_storage_config(stages, requested_parts),
         )
         self._offload_pipeline.initialize()
 
@@ -1199,6 +1220,9 @@ class BasePipeline(nn.Module):
         """Call before dist.destroy_process_group()."""
         self._cuda_profiler_stop()
 
+        if self._offload_pipeline is not None:
+            self._offload_pipeline.cleanup()
+            self._offload_pipeline = None
         for name, runner in self._cuda_graph_runners.items():
             logger.info(f"Releasing CUDA graphs for {name}")
             runner.clear()

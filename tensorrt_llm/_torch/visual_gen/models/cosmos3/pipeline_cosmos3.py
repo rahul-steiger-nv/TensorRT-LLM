@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import math
 import os
+import tempfile
 import time
 from typing import List, Optional, Union
 
@@ -26,6 +28,7 @@ from diffusers.video_processor import VideoProcessor
 from transformers import Qwen2Tokenizer
 
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
+from tensorrt_llm._torch.visual_gen.offloading import SharedOffloadStorageConfig
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
@@ -60,6 +63,12 @@ TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARD
 _COSMOS3_TRANSFORMER_OFFLOAD_STAGES = (
     ("transformer.language_model",),
     ("transformer.gen_layers",),
+)
+_COSMOS3_SHARED_OFFLOAD_PARTS = {"transformer.language_model", "transformer.gen_layers"}
+_COSMOS3_SHARED_OFFLOAD_SKIP_PREFIXES = (
+    "model.layers.",
+    "model.embed_tokens.",
+    "model.norm.",
 )
 _COSMOS3_GUARDRAIL_OFFLOAD_STAGES = (
     ("guardrail.text.qwen",),
@@ -180,6 +189,84 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         ):
             return self.transformer.prepare_offload_pipeline_device()
         return super().offload_pipeline_device(requested_parts)
+
+    def _shared_offload_enabled(self) -> bool:
+        pipeline_config = getattr(self.model_config, "pipeline", None)
+        return bool(getattr(pipeline_config, "offload_shared_memory", False))
+
+    def _distributed_shared_offload_enabled(self) -> bool:
+        return (
+            self._shared_offload_enabled()
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        )
+
+    def _validate_shared_offload(self, requested_parts: set[str]) -> None:
+        if not self._shared_offload_enabled():
+            return
+        if not _COSMOS3_SHARED_OFFLOAD_PARTS.issubset(requested_parts):
+            raise ValueError(
+                "Cosmos3 shared offload memory requires CPU offloading for both "
+                "transformer.language_model and transformer.gen_layers."
+            )
+        if any(part.startswith("guardrail.") for part in requested_parts):
+            raise ValueError(
+                "Cosmos3 shared offload memory does not support guardrail offload yet. "
+                "Disable offload_guardrails for this initial implementation."
+            )
+        if getattr(self.model_config, "dynamic_weight_quant", False):
+            raise ValueError(
+                "Cosmos3 shared offload memory does not support dynamic weight quantization yet."
+            )
+
+    def transformer_weight_skip_prefixes(self) -> tuple[str, ...]:
+        requested_parts = self.requested_offload_parts()
+        self._validate_shared_offload(requested_parts)
+        if self.rank == 0 or not self._distributed_shared_offload_enabled():
+            return ()
+        return _COSMOS3_SHARED_OFFLOAD_SKIP_PREFIXES
+
+    def _shared_offload_storage_path(self, stages: tuple[tuple[str, ...], ...]) -> str:
+        pipeline_config = getattr(self.model_config, "pipeline", None)
+        configured_path = getattr(pipeline_config, "offload_shared_memory_path", "")
+        if configured_path:
+            return configured_path
+
+        base_dir = (
+            "/dev/shm"
+            if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK)
+            else tempfile.gettempdir()
+        )
+        pretrained_config = getattr(self.model_config, "pretrained_config", None)
+        model_id = getattr(pretrained_config, "_name_or_path", "") or self.__class__.__name__
+        stage_summary = "|".join("+".join(stage) for stage in stages)
+        token_input = "|".join(
+            (
+                str(model_id),
+                stage_summary,
+                os.environ.get("MASTER_ADDR", ""),
+                os.environ.get("MASTER_PORT", ""),
+                str(torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1),
+            )
+        )
+        token = hashlib.sha1(token_input.encode("utf-8")).hexdigest()[:16]
+        return os.path.join(base_dir, f"trtllm_cosmos3_offload_{os.getuid()}_{token}.bin")
+
+    def offload_shared_storage_config(
+        self,
+        stages: tuple[tuple[str, ...], ...],
+        requested_parts: set[str],
+    ) -> SharedOffloadStorageConfig | None:
+        self._validate_shared_offload(requested_parts)
+        if not self._distributed_shared_offload_enabled():
+            return None
+
+        return SharedOffloadStorageConfig(
+            path=self._shared_offload_storage_path(stages),
+            is_writer=self.rank == 0,
+            unlink_on_cleanup=self.rank == 0,
+        )
 
     @property
     def default_warmup_resolutions(self):

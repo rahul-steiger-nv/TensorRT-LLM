@@ -1204,7 +1204,7 @@ class Cosmos3VFMTransformer(nn.Module):
 
             if isinstance(module, Linear):
                 weight_dicts = loader.get_linear_weights(module, name, remapped)
-                if weight_dicts:
+                if weight_dicts and any(weight_dicts):
                     loader.load_linear_weights(module, name, weight_dicts)
                     loaded_linear += 1
                 else:

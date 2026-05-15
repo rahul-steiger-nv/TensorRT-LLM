@@ -148,6 +148,7 @@ def parse_args():
             "Ulysses sequence parallel size. Cosmos3 has 8 KV heads, so this must divide 8."
         ),
     )
+    parser.add_argument("--disable_parallel_vae", action="store_true", help="Disable parallel VAE.")
 
     # CUDA graph / torch.compile
     parser.add_argument(
@@ -174,6 +175,22 @@ def parse_args():
         "--offload-guardrails",
         action="store_true",
         help="Keep Cosmos3 guardrail weights on CPU and stage them to GPU only when needed.",
+    )
+    parser.add_argument(
+        "--offload_share_memory",
+        "--offload-share-memory",
+        action="store_true",
+        help=(
+            "Share Cosmos3 CPU offload weights between distributed processes. "
+            "Requires --enable_offloading and does not support guardrail offload yet."
+        ),
+    )
+    parser.add_argument(
+        "--offload_shared_memory_path",
+        "--offload-shared-memory-path",
+        type=str,
+        default="",
+        help="Optional backing file path for --offload_share_memory.",
     )
 
     # Guardrails / profiling
@@ -235,6 +252,7 @@ def _build_visual_gen_args(args) -> VisualGenArgs:
         parallel={
             "dit_cfg_size": args.cfg_size,
             "dit_ulysses_size": args.ulysses_size,
+            "enable_parallel_vae": not args.disable_parallel_vae,
         },
         torch_compile={
             "enable_torch_compile": not args.disable_torch_compile,
@@ -246,6 +264,8 @@ def _build_visual_gen_args(args) -> VisualGenArgs:
             "enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker,
             "enable_offloading": args.enable_offloading,
             "offload_device": "cpu",
+            "offload_shared_memory": args.offload_share_memory,
+            "offload_shared_memory_path": args.offload_shared_memory_path,
             "offload_guardrails": args.offload_guardrails,
         },
     )

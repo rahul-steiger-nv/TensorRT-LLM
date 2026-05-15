@@ -15,7 +15,8 @@
 """Module parameter offloading utilities for visual generation pipelines."""
 
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from pathlib import Path
+from typing import Any, Mapping, Sequence
 
 import torch
 import torch.nn as nn
@@ -76,6 +77,16 @@ class _GroupLayout:
     specs: list[_FlatTensorSpec]
 
 
+@dataclass(frozen=True)
+class SharedOffloadStorageConfig:
+    """File-backed CPU storage shared by multiple visual-generation ranks."""
+
+    path: str
+    is_writer: bool
+    process_group: Any | None = None
+    unlink_on_cleanup: bool = False
+
+
 class ModuleOffloadManager:
     """Pack module groups into CPU storage and stage one group on GPU."""
 
@@ -84,6 +95,7 @@ class ModuleOffloadManager:
         groups: Sequence[_OffloadGroup],
         device: torch.device | str,
         pin_memory: bool = True,
+        shared_storage: SharedOffloadStorageConfig | None = None,
     ) -> None:
         if not groups:
             raise ValueError("At least one offload group must be provided")
@@ -91,6 +103,7 @@ class ModuleOffloadManager:
         self.groups = list(groups)
         self.device = torch.device(device)
         self.pin_memory = pin_memory
+        self.shared_storage = shared_storage
         self.cpu_storage: torch.Tensor | None = None
         self.gpu_arena: torch.Tensor | None = None
         self.layouts: dict[str, _GroupLayout] = {}
@@ -270,6 +283,46 @@ class ModuleOffloadManager:
             else:
                 spec.owner.register_buffer(spec.name, view, persistent=spec.persistent)
 
+    def _barrier(self) -> None:
+        if self.shared_storage is None:
+            return
+        process_group = self.shared_storage.process_group
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(group=process_group) > 1
+        ):
+            torch.distributed.barrier(group=process_group)
+
+    def _allocate_cpu_storage(self, total_cpu_bytes: int) -> torch.Tensor:
+        if self.shared_storage is None:
+            return torch.empty(
+                total_cpu_bytes,
+                dtype=torch.uint8,
+                device="cpu",
+                pin_memory=self.pin_memory,
+            )
+
+        path = Path(self.shared_storage.path)
+        if self.shared_storage.is_writer:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "wb") as storage_file:
+                storage_file.truncate(total_cpu_bytes)
+        self._barrier()
+
+        logger.info(
+            "Using shared module offload CPU storage at %s (%s, writer=%s)",
+            path,
+            _format_bytes(total_cpu_bytes),
+            self.shared_storage.is_writer,
+        )
+        return torch.from_file(
+            str(path),
+            shared=True,
+            size=total_cpu_bytes,
+            dtype=torch.uint8,
+        )
+
     def initialize(self, initial_group: str | None = None) -> None:
         if self.layouts:
             raise RuntimeError("ModuleOffloadManager has already been initialized")
@@ -292,15 +345,13 @@ class ModuleOffloadManager:
             f"groups=[{group_sizes}], device={self.device}"
         )
 
-        self.cpu_storage = torch.empty(
-            total_cpu_bytes,
-            dtype=torch.uint8,
-            device="cpu",
-            pin_memory=self.pin_memory,
-        )
+        self.cpu_storage = self._allocate_cpu_storage(total_cpu_bytes)
 
-        for layout in self.layouts.values():
-            self._copy_group_to_cpu_storage(layout)
+        if self.shared_storage is None or self.shared_storage.is_writer:
+            for layout in self.layouts.values():
+                self._copy_group_to_cpu_storage(layout)
+        if self.shared_storage is not None:
+            self._barrier()
 
         for layout in self.layouts.values():
             assert self.cpu_storage is not None
@@ -314,6 +365,18 @@ class ModuleOffloadManager:
 
         if initial_group is not None:
             self.stage(initial_group)
+
+    def cleanup(self) -> None:
+        if self.shared_storage is None or not self.shared_storage.unlink_on_cleanup:
+            return
+        try:
+            Path(self.shared_storage.path).unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning(
+                "Failed to unlink shared module offload CPU storage %s: %s",
+                self.shared_storage.path,
+                e,
+            )
 
     def _get_layout(self, name: str) -> _GroupLayout:
         try:
@@ -353,6 +416,7 @@ class ForwardHookOffloadPipeline:
         parts: Mapping[str, OffloadPipelinePart],
         device: torch.device | str,
         pin_memory: bool = True,
+        shared_storage: SharedOffloadStorageConfig | None = None,
     ) -> None:
         if not stages:
             raise ValueError("At least one offload pipeline stage must be provided")
@@ -361,6 +425,7 @@ class ForwardHookOffloadPipeline:
         self.parts = dict(parts)
         self.device = torch.device(device)
         self.pin_memory = pin_memory
+        self.shared_storage = shared_storage
         self._hooks: list[RemovableHandle] = []
         self._hook_groups: dict[int, set[str]] = {}
         self._stage_names = tuple("+".join(stage) for stage in self.stages)
@@ -369,6 +434,7 @@ class ForwardHookOffloadPipeline:
             groups=self._build_groups(),
             device=self.device,
             pin_memory=self.pin_memory,
+            shared_storage=self.shared_storage,
         )
 
     def _build_groups(self) -> list[_OffloadGroup]:
@@ -442,3 +508,7 @@ class ForwardHookOffloadPipeline:
             handle.remove()
         self._hooks.clear()
         self._hook_groups.clear()
+
+    def cleanup(self) -> None:
+        self.remove_hooks()
+        self.manager.cleanup()
