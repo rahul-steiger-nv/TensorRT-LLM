@@ -26,7 +26,7 @@ from diffusers.video_processor import VideoProcessor
 from transformers import Qwen2Tokenizer
 
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
-from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
+from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
@@ -57,6 +57,16 @@ COSMOS3_DURATION_TEMPLATE = "The video is {duration:.1f} seconds long and is of 
 COSMOS3_DEFAULT_RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolution."
 TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
 
+_COSMOS3_TRANSFORMER_OFFLOAD_STAGES = (
+    ("transformer.language_model",),
+    ("transformer.gen_layers",),
+)
+_COSMOS3_GUARDRAIL_OFFLOAD_STAGES = (
+    ("guardrail.text.qwen",),
+    ("guardrail.video.safety",),
+    ("guardrail.video.face_blur",),
+)
+
 
 @register_pipeline("Cosmos3OmniMoTPipeline")
 class Cosmos3OmniMoTPipeline(BasePipeline):
@@ -74,8 +84,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             self.transformer.eval()
 
     def load_standard_components(
-        self, checkpoint_dir: str, device: torch.device, skip_components: Optional[list] = []
+        self, checkpoint_dir: str, device: torch.device, skip_components: Optional[list] = None
     ) -> None:
+        skip_components = skip_components or []
+
         if PipelineComponent.TOKENIZER not in skip_components:
             logger.info("Loading tokenizer...")
             self.tokenizer = Qwen2Tokenizer.from_pretrained(
@@ -101,10 +113,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 checkpoint_dir,
                 subfolder=PipelineComponent.SCHEDULER,
             )
+            self.scheduler = UniPCMultistepScheduler.from_config(
+                self.scheduler.config,
+                flow_shift=5.0,
+            )
 
         self.text_guardrail = None
         self.video_guardrail = None
-        if not TRTLLM_DISABLE_COSMOS3_GUARDRAILS and (
+        if self.rank == 0 and not TRTLLM_DISABLE_COSMOS3_GUARDRAILS and (
             PipelineComponent.TEXT_GUARDRAIL not in skip_components
             or PipelineComponent.VIDEO_GUARDRAIL not in skip_components
         ):
@@ -115,12 +131,55 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 guardrail_ckpt_dir = self.model_config.extra_attrs["guardrail_checkpoint_dir"]
             else:
                 guardrail_ckpt_dir = download_guardrail_checkpoint()
+            offload_parts = self.requested_offload_parts()
             if PipelineComponent.TEXT_GUARDRAIL not in skip_components:
-                self.text_guardrail = build_text_guardrail(guardrail_ckpt_dir)
+                self.text_guardrail = build_text_guardrail(
+                    guardrail_ckpt_dir,
+                    device=device,
+                    offload_parts=offload_parts,
+                )
             if PipelineComponent.VIDEO_GUARDRAIL not in skip_components:
-                self.video_guardrail = build_video_guardrail(guardrail_ckpt_dir)
+                self.video_guardrail = build_video_guardrail(
+                    guardrail_ckpt_dir,
+                    device=device,
+                    offload_parts=offload_parts,
+                )
 
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
+
+    def default_offload_stages(self) -> tuple[tuple[str, ...], ...]:
+        pipeline_config = getattr(self.model_config, "pipeline", None)
+        if pipeline_config is None:
+            return ()
+
+        offload_transformer = bool(
+            getattr(pipeline_config, "enable_offloading", False)
+            and getattr(pipeline_config, "offload_device", "cpu") == "cpu"
+        )
+        offload_guardrails = bool(getattr(pipeline_config, "offload_guardrails", False))
+
+        stages: list[tuple[str, ...]] = []
+        if offload_guardrails:
+            stages.append(_COSMOS3_GUARDRAIL_OFFLOAD_STAGES[0])
+        if offload_transformer:
+            stages.extend(_COSMOS3_TRANSFORMER_OFFLOAD_STAGES)
+        if offload_guardrails:
+            stages.extend(_COSMOS3_GUARDRAIL_OFFLOAD_STAGES[1:])
+        return tuple(stages)
+
+    def offload_pipeline_part_owners(self):
+        return (
+            *super().offload_pipeline_part_owners(),
+            getattr(self, "text_guardrail", None),
+            getattr(self, "video_guardrail", None),
+        )
+
+    def offload_pipeline_device(self, requested_parts: set[str]) -> torch.device:
+        if self.transformer is not None and any(
+            part.startswith("transformer.") for part in requested_parts
+        ):
+            return self.transformer.prepare_offload_pipeline_device()
+        return super().offload_pipeline_device(requested_parts)
 
     @property
     def default_warmup_resolutions(self):
@@ -171,6 +230,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             use_resolution_template=req.params.extra_params.get("use_resolution_template", True),
             use_system_prompt=req.params.extra_params.get("use_system_prompt", False),
             use_guardrails=req.params.extra_params.get("use_guardrails", True),
+            profile_memory=req.params.extra_params.get("profile_memory", 0),
         )
 
     def _format_prompt_with_template(
@@ -435,12 +495,13 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         use_resolution_template: bool = COSMOS3_EXTRA_SPECS["use_resolution_template"].default,
         use_system_prompt: bool = COSMOS3_EXTRA_SPECS["use_system_prompt"].default,
         use_guardrails: bool = COSMOS3_EXTRA_SPECS["use_guardrails"].default,
+        profile_memory: int | bool = COSMOS3_EXTRA_SPECS["profile_memory"].default,
     ):
         pipeline_start = time.time()
-        timer = CudaPhaseTimer()
-        timer.mark_pre_start()
 
         use_guardrails = use_guardrails and not TRTLLM_DISABLE_COSMOS3_GUARDRAILS
+        profile_memory_level = 2 if profile_memory is True else int(profile_memory)
+        profile_guardrail_latency = profile_memory_level >= 1
 
         if isinstance(prompt, str):
             prompt = [prompt]
@@ -462,7 +523,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         text_blocked = torch.zeros((), device=self.device, dtype=torch.int32)
         if self.rank == 0 and use_guardrails and self.text_guardrail is not None:
             for p in prompt:
-                is_safe, msg = self.text_guardrail(p)
+                is_safe, msg = self.text_guardrail(
+                    p,
+                    profile_latency=profile_guardrail_latency,
+                )
                 if not is_safe:
                     logger.warning(f"Text guardrail blocked prompt: {msg}")
                     text_blocked.fill_(1)
@@ -472,8 +536,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             torch.distributed.broadcast(text_blocked, src=0)
 
         if text_blocked.item():
-            timer.mark_end()
-            return timer.fill(PipelineOutput())
+            return MediaOutput()
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
@@ -561,6 +624,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 video_shape=video_shape,
                 fps=frame_rate,
                 noisy_frame_mask=velocity_mask,
+                profile_memory=profile_memory,
             )
             if velocity_mask is not None:
                 noise_pred = noise_pred * velocity_mask
@@ -577,17 +641,18 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         self.transformer.reset_cache()
 
         # 6. Denoise
-        timer.mark_denoise_start()
-        latents = self.denoise(
-            latents=latents,
-            scheduler=self.scheduler,
-            prompt_embeds=cond_ids,  # placeholder — actual conditioning via extra_cfg_tensors
-            neg_prompt_embeds=uncond_ids,
-            guidance_scale=guidance_scale,
-            forward_fn=forward_fn,
-            extra_cfg_tensors=extra_cfg_tensors,
-        )
-        timer.mark_post_start()
+        try:
+            latents = self.denoise(
+                latents=latents,
+                scheduler=self.scheduler,
+                prompt_embeds=cond_ids,  # placeholder — actual conditioning via extra_cfg_tensors
+                neg_prompt_embeds=uncond_ids,
+                guidance_scale=guidance_scale,
+                forward_fn=forward_fn,
+                extra_cfg_tensors=extra_cfg_tensors,
+            )
+        finally:
+            self.transformer.reset_cache()
 
         # 7. Decode
         logger.info("Decoding video...")
@@ -606,7 +671,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             logger.info(f"Total pipeline time: {time.time() - pipeline_start:.2f}s")
 
             if use_guardrails and self.video_guardrail is not None:
-                video = check_video_safety(video, self.video_guardrail)
+                video = check_video_safety(
+                    video,
+                    self.video_guardrail,
+                    profile_latency=profile_guardrail_latency,
+                )
                 if video is None:
                     logger.warning("Video guardrail blocked video generation")
                     video_blocked.fill_(1)
@@ -615,8 +684,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             torch.distributed.broadcast(video_blocked, src=0)
 
         if video_blocked.item():
-            timer.mark_end()
-            return timer.fill(PipelineOutput())
+            return MediaOutput()
 
-        timer.mark_end()
-        return timer.fill(PipelineOutput(video=video, frame_rate=frame_rate))
+        return MediaOutput(video=video)
