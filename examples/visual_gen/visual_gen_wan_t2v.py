@@ -260,6 +260,11 @@ def parse_args():
     parser.add_argument(
         "--enable_layerwise_nvtx_marker", action="store_true", help="Enable layerwise NVTX markers"
     )
+    parser.add_argument(
+        "--enable_cuda_memory_logging",
+        action="store_true",
+        help="Enable per-rank CUDA peak memory logging for development.",
+    )
 
     return parser.parse_args()
 
@@ -351,6 +356,7 @@ def main():
         cuda_graph={"enable_cuda_graph": args.enable_cudagraph},
         pipeline={
             "enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker,
+            "enable_cuda_memory_logging": args.enable_cuda_memory_logging,
             "enable_offloading": args.enable_offloading,
             "offload_device": "cpu",
         },

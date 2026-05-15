@@ -348,6 +348,7 @@ class PipelineConfig(StrictBaseModel):
 
     fuse_qkv: bool = True
     enable_layerwise_nvtx_marker: bool = False
+    enable_cuda_memory_logging: bool = False
 
     # Offloading
     enable_offloading: bool = False

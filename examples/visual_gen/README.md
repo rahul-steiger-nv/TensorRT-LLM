@@ -105,11 +105,14 @@ python visual_gen_wan_t2v.py \
     --prompt "A cute cat playing piano" \
     --height 480 --width 832 --num_frames 33 \
     --enable_offloading \
+    --enable_cuda_memory_logging \
     --output_path output_offloaded.avi
 ```
 
 For Wan text-to-video, CPU offloading stages the text encoder and transformer
-blocks between CPU and GPU to reduce peak GPU memory usage.
+blocks between CPU and GPU to reduce peak GPU memory usage. CUDA peak memory
+logging is disabled by default; add `--enable_cuda_memory_logging` to log each
+rank's peak allocator memory for development comparisons.
 
 ### Multi-GPU Parallelism
 
