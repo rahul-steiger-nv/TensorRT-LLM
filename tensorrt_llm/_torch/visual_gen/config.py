@@ -345,6 +345,20 @@ class CompilationConfig(StrictBaseModel):
     )
 
 
+class OffloadPipelineStageConfig(StrictBaseModel):
+    """Configuration for one visual-generation offload stage."""
+
+    parts: List[str] = PydanticField(
+        min_length=1,
+        description=(
+            "Model-defined offload parts to pack into this stage. "
+            "For Cosmos3 examples include transformer.language_model, "
+            "transformer.gen_layers, guardrail.text.qwen, "
+            "guardrail.video.safety, and guardrail.video.face_blur."
+        ),
+    )
+
+
 class PipelineConfig(StrictBaseModel):
     """Model-specific pipeline configuration."""
 
@@ -355,6 +369,32 @@ class PipelineConfig(StrictBaseModel):
     enable_offloading: bool = False
     offload_device: Literal["cpu", "cuda"] = "cpu"
     offload_param_pin_memory: bool = True
+    offload_guardrails: bool = PydanticField(
+        False,
+        description=(
+            "Keep guardrail model weights on CPU and stage them to the target "
+            "device only while guardrail checks run."
+        ),
+    )
+    offload_pipeline: List[OffloadPipelineStageConfig] = PydanticField(
+        default_factory=list,
+        description=(
+            "Ordered visual-generation offload pipeline. Each item lists the "
+            "model-defined parts packed into one runtime group. When set, this "
+            "explicit pipeline overrides enable_offloading and offload_guardrails "
+            "shorthand defaults."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_offload_pipeline(self) -> "PipelineConfig":
+        seen: set[str] = set()
+        for stage in self.offload_pipeline:
+            stage_name = "+".join(stage.parts)
+            if stage_name in seen:
+                raise ValueError(f"Duplicate offload pipeline stage: {stage_name}")
+            seen.add(stage_name)
+        return self
 
 
 # =============================================================================

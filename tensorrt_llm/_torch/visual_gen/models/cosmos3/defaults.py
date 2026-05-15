@@ -56,4 +56,13 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         default=True,
         description="Whether to use the guardrails.",
     ),
+    "profile_memory": ExtraParamSchema(
+        type="int",
+        default=0,
+        description=(
+            "Cosmos3 memory profiling level. 0 disables profiling, 1 profiles "
+            "guardrail latency, and 2 also logs transformer CUDA memory."
+        ),
+        range=(0, 2),
+    ),
 }

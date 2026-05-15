@@ -316,8 +316,19 @@ class BasePipeline(nn.Module):
         """Return model-specific default offload stages for shorthand config."""
         return ()
 
+    def _configured_offload_pipeline_stages(self) -> tuple[OffloadPipelineStage, ...]:
+        pipeline_config = getattr(self.model_config, "pipeline", None)
+        if pipeline_config is None:
+            return ()
+
+        offload_pipeline = getattr(pipeline_config, "offload_pipeline", [])
+        if offload_pipeline:
+            return tuple(tuple(stage.parts) for stage in offload_pipeline)
+
+        return self.default_offload_stages()
+
     def requested_offload_parts(self) -> set[str]:
-        return {part for stage in self.default_offload_stages() for part in stage}
+        return {part for stage in self._configured_offload_pipeline_stages() for part in stage}
 
     def offload_pipeline_part_owners(self) -> tuple[Any, ...]:
         return tuple(self.modules())
@@ -337,6 +348,10 @@ class BasePipeline(nn.Module):
         stages: tuple[OffloadPipelineStage, ...],
         available_parts: dict[str, OffloadPipelinePart],
     ) -> tuple[OffloadPipelineStage, ...]:
+        pipeline_config = getattr(self.model_config, "pipeline", None)
+        if getattr(pipeline_config, "offload_pipeline", []):
+            return stages
+
         return tuple(
             tuple(part for part in stage if part in available_parts)
             for stage in stages
@@ -348,7 +363,7 @@ class BasePipeline(nn.Module):
         return torch.device(self.device)
 
     def initialize_offload_pipeline(self) -> None:
-        configured_stages = self.default_offload_stages()
+        configured_stages = self._configured_offload_pipeline_stages()
         if not configured_stages or self._offload_pipeline is not None:
             return
 

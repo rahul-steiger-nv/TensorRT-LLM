@@ -28,6 +28,7 @@ from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
+from tensorrt_llm._torch.visual_gen.offloading import OffloadPipelinePart
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -721,12 +722,95 @@ class Cosmos3VFMTransformer(nn.Module):
 
         self.cached_kv = None
         self.cached_freqs_gen = None
+        self._offload_gpu_device: torch.device | None = None
 
         self.__post_init__()
 
     @property
     def device(self):
+        if self._offload_gpu_device is not None:
+            return self._offload_gpu_device
         return next(self.parameters()).device
+
+    def _configured_offload_parts(self) -> set[str]:
+        pipeline_config = getattr(self.model_config, "pipeline", None)
+        if pipeline_config is None:
+            return set()
+
+        offload_pipeline = getattr(pipeline_config, "offload_pipeline", [])
+        if offload_pipeline:
+            return {
+                part
+                for stage in offload_pipeline
+                for part in stage.parts
+                if part.startswith("transformer.")
+            }
+
+        if bool(
+            getattr(pipeline_config, "enable_offloading", False)
+            and getattr(pipeline_config, "offload_device", "cpu") == "cpu"
+        ):
+            return {"transformer.language_model", "transformer.gen_layers"}
+
+        return set()
+
+    def load_time_cpu_offload_modules(self) -> tuple[nn.Module, ...]:
+        parts = self._configured_offload_parts()
+        modules: list[nn.Module] = []
+        if "transformer.language_model" in parts:
+            modules.append(self.language_model)
+        if "transformer.gen_layers" in parts:
+            modules.append(self.gen_layers)
+        return tuple(modules)
+
+    def prepare_offload_pipeline_device(self) -> torch.device:
+        self._offload_gpu_device = self._infer_offload_gpu_device()
+        return self._offload_gpu_device
+
+    def offload_pipeline_parts(self) -> dict[str, OffloadPipelinePart]:
+        return {
+            "transformer.language_model": OffloadPipelinePart(
+                module=self.language_model,
+                hook_modules=(self.language_model, self.language_model.rotary_emb),
+            ),
+            "transformer.gen_layers": OffloadPipelinePart(
+                module=self.gen_layers,
+                hook_modules=tuple(self.gen_layers),
+            ),
+        }
+
+    @staticmethod
+    def _format_cuda_memory(num_bytes: int) -> str:
+        return f"{num_bytes / (1024**3):.2f} GiB"
+
+    def _log_cuda_memory(self, label: str, device: torch.device, reset_peak: bool = False) -> None:
+        if device.type != "cuda" or not torch.cuda.is_available():
+            return
+
+        torch.cuda.synchronize(device)
+        if reset_peak:
+            torch.cuda.reset_peak_memory_stats(device)
+
+        allocated = torch.cuda.memory_allocated(device)
+        reserved = torch.cuda.memory_reserved(device)
+        peak_allocated = torch.cuda.max_memory_allocated(device)
+        logger.info(
+            f"Cosmos3 memory {label}: "
+            f"allocated={self._format_cuda_memory(allocated)}, "
+            f"reserved={self._format_cuda_memory(reserved)}, "
+            f"max_allocated={self._format_cuda_memory(peak_allocated)}"
+        )
+
+    def _infer_offload_gpu_device(self) -> torch.device:
+        for module in (self.vae2llm, self.llm2vae, self.time_embedder, self.norm_moe_gen):
+            for tensor in list(module.parameters()) + list(module.buffers()):
+                if tensor.device.type == "cuda":
+                    return tensor.device
+
+        if torch.cuda.is_available():
+            return torch.device("cuda", torch.cuda.current_device())
+
+        raise RuntimeError("Cosmos3 CPU offloading requires a CUDA device for the staging arena")
 
     def __post_init__(self):
         # TODO: move this to pipeline loader under meta init so transformers' dont need to know about it here
@@ -853,6 +937,7 @@ class Cosmos3VFMTransformer(nn.Module):
         video_shape: Tuple[int, int, int],
         fps: float | None = None,
         noisy_frame_mask: torch.Tensor | None = None,
+        profile_memory: int | bool = 0,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -877,6 +962,8 @@ class Cosmos3VFMTransformer(nn.Module):
         T, H, W = video_shape
         Hp, Wp, _, _ = self._pad_to_patch_size(H, W)
         max_real_len = text_mask.sum(dim=1).max().item()
+        profile_memory_level = 2 if profile_memory is True else int(profile_memory)
+        profile_forward_memory = profile_memory_level >= 2
 
         hidden_gen = self.vae2llm(self.patchify(hidden_states, T, H, W))
 
@@ -908,7 +995,13 @@ class Cosmos3VFMTransformer(nn.Module):
                 hidden_states.device,
                 hidden_states.dtype,
             )
+            if profile_forward_memory:
+                self._log_cuda_memory(
+                    "non-offload before UND cache build", hidden_states.device, reset_peak=True
+                )
             cached_kv_full = self.language_model(text_ids, text_mask, freqs_und)
+            if profile_forward_memory:
+                self._log_cuda_memory("non-offload after UND cache build", hidden_states.device)
             self.cached_freqs_gen = freqs_gen
 
             if self.use_seq_parallel:
@@ -963,6 +1056,11 @@ class Cosmos3VFMTransformer(nn.Module):
         else:
             freqs_gen = self.cached_freqs_gen
 
+        if profile_forward_memory:
+            self._log_cuda_memory(
+                "non-offload before GEN denoising", hidden_states.device, reset_peak=True
+            )
+
         for i, layer in enumerate(self.gen_layers):
             k_und, v_und = self.cached_kv[i]
             if self.seq_parallel_size <= 1:
@@ -977,7 +1075,10 @@ class Cosmos3VFMTransformer(nn.Module):
             hidden_gen = torch.cat(parts, dim=1)[:, :S_gen]  # [B, S_gen, patch_latent_dim]
 
         hidden_gen = self.norm_moe_gen(hidden_gen)
-        return self.unpatchify(self.llm2vae(hidden_gen), T, H, W)
+        output = self.unpatchify(self.llm2vae(hidden_gen), T, H, W)
+        if profile_forward_memory:
+            self._log_cuda_memory("non-offload after GEN denoising", hidden_states.device)
+        return output
 
     def load_weights(self, weights: dict) -> None:
         """Load weights with key remapping from Diffusers/HF Cosmos3 checkpoints.
