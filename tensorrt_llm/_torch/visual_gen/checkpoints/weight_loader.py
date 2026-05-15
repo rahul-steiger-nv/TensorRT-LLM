@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Sequence, Union
 
 import torch
 import tqdm
@@ -26,7 +26,11 @@ class WeightLoader(BaseWeightLoader):
         # Returns: {"transformer": {...}, "transformer_2": {...}}
     """
 
-    def __init__(self, components: Union[str, List[str]] = PipelineComponent.TRANSFORMER):
+    def __init__(
+        self,
+        components: Union[str, List[str]] = PipelineComponent.TRANSFORMER,
+        skip_prefixes: Sequence[str] = (),
+    ):
         """
         Args:
             components: Component(s) to load weights for. Can be:
@@ -39,6 +43,10 @@ class WeightLoader(BaseWeightLoader):
         else:
             self.components = components
             self.single_component = False
+        self.skip_prefixes = tuple(skip_prefixes)
+
+    def _should_skip_key(self, key: str) -> bool:
+        return any(key.startswith(prefix) for prefix in self.skip_prefixes)
 
     def load_weights(
         self,
@@ -145,8 +153,23 @@ class WeightLoader(BaseWeightLoader):
         """Load weights from a single file."""
         logger.debug(f"Loading {filepath}")
         if filepath.endswith(".safetensors"):
+            if self.skip_prefixes:
+                from safetensors import safe_open
+
+                with safe_open(filepath, framework="pt", device="cpu") as f:
+                    return {
+                        key: f.get_tensor(key)
+                        for key in f.keys()
+                        if not self._should_skip_key(key)
+                    }
+
             from safetensors.torch import load_file
 
             return load_file(filepath)
-        else:
-            return torch.load(filepath, map_location="cpu", weights_only=True)
+
+        weights = torch.load(filepath, map_location="cpu", weights_only=True)
+        if self.skip_prefixes:
+            weights = {
+                key: value for key, value in weights.items() if not self._should_skip_key(key)
+            }
+        return weights
