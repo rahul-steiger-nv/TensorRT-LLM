@@ -76,6 +76,12 @@ class _GroupLayout:
     specs: list[_FlatTensorSpec]
 
 
+@dataclass(frozen=True)
+class _CachedGroupViews:
+    cpu: tuple[nn.Parameter | torch.Tensor, ...]
+    gpu: tuple[nn.Parameter | torch.Tensor, ...]
+
+
 class ModuleOffloadManager:
     """Pack module groups into CPU storage and stage one group on GPU."""
 
@@ -94,6 +100,7 @@ class ModuleOffloadManager:
         self.cpu_storage: torch.Tensor | None = None
         self.gpu_arena: torch.Tensor | None = None
         self.layouts: dict[str, _GroupLayout] = {}
+        self._cached_views: dict[str, _CachedGroupViews] = {}
         self.active_group_name: str | None = None
 
         seen_names: set[str] = set()
@@ -258,16 +265,33 @@ class ModuleOffloadManager:
         typed_view = byte_view.view(spec.dtype)
         return typed_view.as_strided(spec.shape, spec.stride)
 
-    def _bind_views(self, layout: _GroupLayout, storage: torch.Tensor, use_gpu_offsets: bool) -> None:
+    def _make_views(
+        self,
+        layout: _GroupLayout,
+        storage: torch.Tensor,
+        use_gpu_offsets: bool,
+    ) -> tuple[nn.Parameter | torch.Tensor, ...]:
+        views: list[nn.Parameter | torch.Tensor] = []
         for spec in layout.specs:
             offset = spec.gpu_offset if use_gpu_offsets else spec.cpu_offset
             view = self._typed_view(storage, offset, spec)
             if spec.is_parameter:
-                spec.owner.register_parameter(
-                    spec.name,
-                    nn.Parameter(view, requires_grad=spec.requires_grad),
-                )
+                views.append(nn.Parameter(view, requires_grad=spec.requires_grad))
             else:
+                views.append(view)
+        return tuple(views)
+
+    def _bind_views(
+        self,
+        layout: _GroupLayout,
+        views: tuple[nn.Parameter | torch.Tensor, ...],
+    ) -> None:
+        for spec, view in zip(layout.specs, views, strict=True):
+            if spec.is_parameter:
+                assert isinstance(view, nn.Parameter)
+                spec.owner.register_parameter(spec.name, view)
+            else:
+                assert isinstance(view, torch.Tensor)
                 spec.owner.register_buffer(spec.name, view, persistent=spec.persistent)
 
     def initialize(self, initial_group: str | None = None) -> None:
@@ -302,15 +326,17 @@ class ModuleOffloadManager:
         for layout in self.layouts.values():
             self._copy_group_to_cpu_storage(layout)
 
-        for layout in self.layouts.values():
-            assert self.cpu_storage is not None
-            self._bind_views(layout, self.cpu_storage, use_gpu_offsets=False)
-
         self.gpu_arena = torch.empty(max_gpu_bytes, dtype=torch.uint8, device=self.device)
 
-        for layout in self.layouts.values():
+        for name, layout in self.layouts.items():
+            assert self.cpu_storage is not None
             assert self.gpu_arena is not None
-            self._bind_views(layout, self.gpu_arena, use_gpu_offsets=True)
+            cached_views = _CachedGroupViews(
+                cpu=self._make_views(layout, self.cpu_storage, use_gpu_offsets=False),
+                gpu=self._make_views(layout, self.gpu_arena, use_gpu_offsets=True),
+            )
+            self._cached_views[name] = cached_views
+            self._bind_views(layout, cached_views.cpu)
 
         if initial_group is not None:
             self.stage(initial_group)
@@ -327,8 +353,10 @@ class ModuleOffloadManager:
         layout = self._get_layout(name)
         if self.active_group_name == name:
             return
-        if self.cpu_storage is None or self.gpu_arena is None:
+        if self.cpu_storage is None or self.gpu_arena is None or not self._cached_views:
             raise RuntimeError("ModuleOffloadManager must be initialized before staging")
+
+        self._deactivate_active_group()
 
         src = self.cpu_storage.narrow(0, layout.cpu_offset, layout.nbytes)
         dst = self.gpu_arena.narrow(0, 0, layout.nbytes)
@@ -341,7 +369,19 @@ class ModuleOffloadManager:
                 f"Failed to stage offload group '{name}' ({_format_bytes(layout.nbytes)}) "
                 f"to {self.device}"
             ) from e
+        self._bind_views(layout, self._cached_views[name].gpu)
         self.active_group_name = name
+
+    def _deactivate_active_group(self) -> None:
+        if self.active_group_name is None:
+            return
+        if not self._cached_views:
+            raise RuntimeError("ModuleOffloadManager must be initialized before staging")
+
+        active_name = self.active_group_name
+        active_layout = self._get_layout(active_name)
+        self._bind_views(active_layout, self._cached_views[active_name].cpu)
+        self.active_group_name = None
 
 
 class ForwardHookOffloadPipeline:
