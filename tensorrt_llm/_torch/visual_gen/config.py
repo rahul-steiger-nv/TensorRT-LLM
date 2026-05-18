@@ -383,6 +383,14 @@ class PipelineConfig(StrictBaseModel):
             "Cosmos3 chooses a node-local path automatically."
         ),
     )
+    offload_shared_memory_scope: Literal["global", "numa"] = PydanticField(
+        "global",
+        description=(
+            "Scope for shared CPU offload storage. 'global' creates one shared "
+            "copy across all distributed ranks; 'numa' creates one shared copy "
+            "per local NUMA node."
+        ),
+    )
     offload_guardrails: bool = PydanticField(
         False,
         description=(

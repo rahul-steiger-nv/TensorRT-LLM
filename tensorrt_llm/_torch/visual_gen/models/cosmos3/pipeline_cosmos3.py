@@ -28,6 +28,11 @@ from diffusers.video_processor import VideoProcessor
 from transformers import Qwen2Tokenizer
 
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
+from tensorrt_llm._torch.visual_gen.numa import (
+    NumaSharedOffloadContext,
+    add_numa_suffix_to_path,
+    create_numa_shared_offload_context,
+)
 from tensorrt_llm._torch.visual_gen.offloading import SharedOffloadStorageConfig
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
@@ -81,6 +86,9 @@ _COSMOS3_GUARDRAIL_OFFLOAD_STAGES = (
 class Cosmos3OmniMoTPipeline(BasePipeline):
     def __init__(self, model_config):
         super().__init__(model_config)
+        self._numa_shared_offload_context: NumaSharedOffloadContext | None = None
+        self._numa_shared_offload_context_initialized = False
+        self._numa_affinity_warning_logged = False
 
     def _init_transformer(self) -> None:
         logger.info("Initializing Cosmos3VFMTransformer")
@@ -194,6 +202,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         pipeline_config = getattr(self.model_config, "pipeline", None)
         return bool(getattr(pipeline_config, "offload_shared_memory", False))
 
+    def _shared_offload_scope(self) -> str:
+        pipeline_config = getattr(self.model_config, "pipeline", None)
+        return getattr(pipeline_config, "offload_shared_memory_scope", "global")
+
     def _distributed_shared_offload_enabled(self) -> bool:
         return (
             self._shared_offload_enabled()
@@ -220,17 +232,86 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 "Cosmos3 shared offload memory does not support dynamic weight quantization yet."
             )
 
+    def _get_numa_shared_offload_context(self) -> NumaSharedOffloadContext | None:
+        if self._numa_shared_offload_context_initialized:
+            return self._numa_shared_offload_context
+
+        self._numa_shared_offload_context_initialized = True
+        if (
+            self._shared_offload_scope() != "numa"
+            or not self._distributed_shared_offload_enabled()
+        ):
+            return None
+
+        try:
+            context = create_numa_shared_offload_context(require_complete_numa_detection=True)
+        except RuntimeError as e:
+            raise ValueError(
+                "Cosmos3 NUMA-scoped shared offload requires all ranks to have a "
+                "detectable NUMA node. Bind ranks to NUMA-local CPU sets or use "
+                "offload_shared_memory_scope='global'."
+            ) from e
+
+        if context is None:
+            raise ValueError(
+                "Cosmos3 NUMA-scoped shared offload requires distributed execution "
+                "with world_size > 1."
+            )
+
+        if (
+            len(context.rank_info.affinity_numa_nodes) > 1
+            and not self._numa_affinity_warning_logged
+        ):
+            logger.warning(
+                "Rank %s CPU affinity spans NUMA nodes %s; shared offload pages are "
+                "placed by first touch, so bind ranks to NUMA-local CPU sets for best locality.",
+                self.rank,
+                context.rank_info.affinity_numa_nodes,
+            )
+            self._numa_affinity_warning_logged = True
+
+        if len(context.group_ranks) <= 1:
+            logger.info(
+                "Rank %s is the only rank in NUMA shared offload group %s; "
+                "using regular per-rank CPU offload storage.",
+                self.rank,
+                context.group_key,
+            )
+            return None
+
+        self._numa_shared_offload_context = context
+        return context
+
     def transformer_weight_skip_prefixes(self) -> tuple[str, ...]:
         requested_parts = self.requested_offload_parts()
         self._validate_shared_offload(requested_parts)
-        if self.rank == 0 or not self._distributed_shared_offload_enabled():
+        if not self._distributed_shared_offload_enabled():
+            return ()
+
+        if self._shared_offload_scope() == "numa":
+            context = self._get_numa_shared_offload_context()
+            if context is None or self.rank == context.writer_rank:
+                return ()
+            return _COSMOS3_SHARED_OFFLOAD_SKIP_PREFIXES
+
+        if self.rank == 0:
             return ()
         return _COSMOS3_SHARED_OFFLOAD_SKIP_PREFIXES
 
-    def _shared_offload_storage_path(self, stages: tuple[tuple[str, ...], ...]) -> str:
+    def _shared_offload_storage_path(
+        self,
+        stages: tuple[tuple[str, ...], ...],
+        numa_context: NumaSharedOffloadContext | None = None,
+    ) -> str:
         pipeline_config = getattr(self.model_config, "pipeline", None)
         configured_path = getattr(pipeline_config, "offload_shared_memory_path", "")
         if configured_path:
+            if numa_context is not None:
+                return add_numa_suffix_to_path(
+                    configured_path,
+                    numa_context.group_key[0],
+                    numa_context.group_key[1],
+                )
             return configured_path
 
         base_dir = (
@@ -251,7 +332,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             )
         )
         token = hashlib.sha1(token_input.encode("utf-8")).hexdigest()[:16]
-        return os.path.join(base_dir, f"trtllm_cosmos3_offload_{os.getuid()}_{token}.bin")
+        path = os.path.join(base_dir, f"trtllm_cosmos3_offload_{os.getuid()}_{token}.bin")
+        if numa_context is not None:
+            return add_numa_suffix_to_path(
+                path,
+                numa_context.group_key[0],
+                numa_context.group_key[1],
+            )
+        return path
 
     def offload_shared_storage_config(
         self,
@@ -261,6 +349,17 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         self._validate_shared_offload(requested_parts)
         if not self._distributed_shared_offload_enabled():
             return None
+
+        if self._shared_offload_scope() == "numa":
+            context = self._get_numa_shared_offload_context()
+            if context is None:
+                return None
+            return SharedOffloadStorageConfig(
+                path=self._shared_offload_storage_path(stages, context),
+                is_writer=self.rank == context.writer_rank,
+                process_group=context.process_group,
+                unlink_on_cleanup=self.rank == context.writer_rank,
+            )
 
         return SharedOffloadStorageConfig(
             path=self._shared_offload_storage_path(stages),

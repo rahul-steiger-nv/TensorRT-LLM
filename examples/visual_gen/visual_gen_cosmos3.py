@@ -192,6 +192,17 @@ def parse_args():
         default="",
         help="Optional backing file path for --offload_share_memory.",
     )
+    parser.add_argument(
+        "--offload_shared_memory_scope",
+        "--offload-shared-memory-scope",
+        type=str,
+        default="global",
+        choices=("global", "numa"),
+        help=(
+            "Shared offload storage scope: 'global' uses one copy for all ranks, "
+            "'numa' uses one copy per NUMA node."
+        ),
+    )
 
     # Guardrails / profiling
     parser.add_argument(
@@ -266,6 +277,7 @@ def _build_visual_gen_args(args) -> VisualGenArgs:
             "offload_device": "cpu",
             "offload_shared_memory": args.offload_share_memory,
             "offload_shared_memory_path": args.offload_shared_memory_path,
+            "offload_shared_memory_scope": args.offload_shared_memory_scope,
             "offload_guardrails": args.offload_guardrails,
         },
     )
