@@ -294,7 +294,7 @@ class ModuleOffloadManager:
                 assert isinstance(view, torch.Tensor)
                 spec.owner.register_buffer(spec.name, view, persistent=spec.persistent)
 
-    def initialize(self, initial_group: str | None = None) -> None:
+    def initialize(self) -> None:
         if self.layouts:
             raise RuntimeError("ModuleOffloadManager has already been initialized")
 
@@ -337,9 +337,6 @@ class ModuleOffloadManager:
             )
             self._cached_views[name] = cached_views
             self._bind_views(layout, cached_views.cpu)
-
-        if initial_group is not None:
-            self.stage(initial_group)
 
     def _get_layout(self, name: str) -> _GroupLayout:
         try:
@@ -452,8 +449,8 @@ class ForwardHookOffloadPipeline:
             seen.add(module_id)
         return tuple(unique)
 
-    def initialize(self, initial_group: str | None = None) -> None:
-        self.manager.initialize(initial_group=initial_group)
+    def initialize(self) -> None:
+        self.manager.initialize()
         self._register_hooks()
 
     def _register_hooks(self) -> None:
@@ -482,3 +479,7 @@ class ForwardHookOffloadPipeline:
             handle.remove()
         self._hooks.clear()
         self._hook_groups.clear()
+
+    def cleanup(self) -> None:
+        self.remove_hooks()
+        self.manager._deactivate_active_group()

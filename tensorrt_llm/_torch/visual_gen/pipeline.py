@@ -1040,6 +1040,9 @@ class BasePipeline(nn.Module):
 
     def cleanup(self):
         """Call before dist.destroy_process_group()."""
+        if self._offload_pipeline is not None:
+            self._offload_pipeline.cleanup()
+            self._offload_pipeline = None
         for name, runner in self._cuda_graph_runners.items():
             logger.info(f"Releasing CUDA graphs for {name}")
             runner.clear()
