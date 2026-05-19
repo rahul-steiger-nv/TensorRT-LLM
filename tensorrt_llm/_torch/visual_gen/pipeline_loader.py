@@ -270,6 +270,13 @@ class PipelineLoader:
     def _get_load_time_cpu_offload_modules(
         self, pipeline: "BasePipeline"
     ) -> list[torch.nn.Module]:
+        """Return offloaded modules that should materialize on CPU at load time.
+
+        The offload manager is initialized only after weights and quantization
+        hooks run, but MetaInit materialization happens before loading. This
+        helper mirrors the pipeline's configured stages so offloaded towers never
+        need to materialize on GPU first.
+        """
         available_parts = pipeline.collect_offload_pipeline_parts()
         modules: list[torch.nn.Module] = []
         seen: set[int] = set()
@@ -331,6 +338,7 @@ class PipelineLoader:
 
     @staticmethod
     def _collect_module_tensor_ids(modules: list[torch.nn.Module]) -> set[int]:
+        """Collect parameter and buffer object IDs owned by ``modules``."""
         tensor_ids: set[int] = set()
         for module in modules:
             for child in module.modules():

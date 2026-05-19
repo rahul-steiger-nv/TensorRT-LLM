@@ -12,7 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Module parameter offloading utilities for visual generation pipelines."""
+"""Module parameter offloading utilities for visual generation pipelines.
+
+The offload path keeps model loading and quantization unchanged: weights are
+loaded into the modules first, then selected module groups are copied into
+packed CPU storage. At runtime one group at a time is staged into a reusable GPU
+arena and the original module parameters/buffers are rebound to views of that
+storage.
+"""
 
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -32,12 +39,19 @@ def _format_bytes(num_bytes: int) -> str:
     return f"{num_bytes / (1024**3):.2f} GiB"
 
 
+# FlashInfer and other custom kernels can require tensor data pointers to be at
+# least 16-byte aligned even for smaller dtypes such as BF16.
 _PACKED_TENSOR_ALIGNMENT = 16
 
 
 @dataclass(frozen=True)
 class OffloadPipelinePart:
-    """One model-defined offloadable module subtree."""
+    """One model-defined offloadable module subtree.
+
+    Pipeline implementations expose these parts by name, then choose stages that
+    group one or more parts together. A stage becomes the unit that is copied
+    from CPU storage into the GPU arena.
+    """
 
     module: nn.Module
 
@@ -63,6 +77,8 @@ class _FlatTensorSpec:
 
 @dataclass
 class _GroupLayout:
+    """Packed storage layout and rebound views for one offload group."""
+
     name: str
     module: nn.Module
     cpu_offset: int
@@ -73,7 +89,16 @@ class _GroupLayout:
 
 
 class ModuleOffloadManager:
-    """Pack module groups into CPU storage and stage one group on GPU."""
+    """Pack module groups into CPU storage and stage one group on GPU.
+
+    The manager owns two flat byte buffers:
+    - ``cpu_storage`` contains all offloaded groups.
+    - ``gpu_arena`` is reused for whichever group is currently active.
+
+    Initializing the manager temporarily keeps both the original CPU tensors and
+    packed CPU storage alive. This preserves compatibility with quantization
+    flows that may replace or repack parameters during loading.
+    """
 
     def __init__(
         self,
@@ -202,6 +227,13 @@ class ModuleOffloadManager:
         seen_tensors: dict[tuple[int, int], _FlatTensorSpec],
         specs: list[_FlatTensorSpec],
     ) -> int:
+        """Append a tensor spec and return the next GPU-local byte offset.
+
+        This handles three layout concerns in one place: alias reuse, packed
+        tensor alignment, and spec construction. CPU offsets are absolute within
+        the full packed storage, while GPU offsets are relative to the reusable
+        arena.
+        """
         display_name = f"{group_name}.{qualified_name}"
         alias = self._get_alias_spec(seen_tensors, tensor, display_name)
         if alias is None:
@@ -230,6 +262,7 @@ class ModuleOffloadManager:
     def _collect_group_layout(
         self, group_name: str, group_module: nn.Module, cpu_offset: int
     ) -> _GroupLayout:
+        """Build the packed storage layout for one named module group."""
         gpu_offset = 0
         specs: list[_FlatTensorSpec] = []
         seen_tensors: dict[tuple[int, int], _FlatTensorSpec] = {}
@@ -348,6 +381,7 @@ class ModuleOffloadManager:
                 spec.owner.register_buffer(spec.name, view, persistent=spec.persistent)
 
     def initialize(self) -> None:
+        """Allocate packed storage, copy current tensors, and bind CPU views."""
         if self.layouts:
             raise RuntimeError("ModuleOffloadManager has already been initialized")
 
@@ -389,6 +423,7 @@ class ModuleOffloadManager:
             ) from e
 
     def stage(self, name: str) -> None:
+        """Stage one offload group into the GPU arena and rebind its tensors."""
         layout = self._get_layout(name)
         if self.active_group_name == name:
             return
@@ -432,7 +467,12 @@ class ModuleOffloadManager:
 
 
 class OffloadPipeline:
-    """Stage offload groups explicitly from call-site contexts."""
+    """Stage offload groups explicitly from model call-site contexts.
+
+    This class intentionally does not use forward hooks. Pipeline code must wrap
+    the relevant call site with ``with self.offload_context("group")`` so staging
+    happens before the model invocation and outside any later CUDA graph capture.
+    """
 
     def __init__(
         self,
@@ -480,6 +520,7 @@ class OffloadPipeline:
         return groups
 
     def initialize(self) -> None:
+        """Allocate and populate backing storage for all configured stages."""
         self.manager.initialize()
 
     @staticmethod
@@ -487,8 +528,10 @@ class OffloadPipeline:
         return stage if isinstance(stage, str) else "+".join(stage)
 
     def context(self, group_name: str):
+        """Stage ``group_name`` and return a no-op context manager."""
         self.manager.stage(group_name)
         return nullcontext()
 
     def cleanup(self) -> None:
+        """Return the active group to CPU-backed views."""
         self.manager._deactivate_active_group()

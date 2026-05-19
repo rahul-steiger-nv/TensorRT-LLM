@@ -187,6 +187,7 @@ class WanPipeline(BasePipeline):
             self.transformer_2 = WanTransformer3DModel(model_config=self.model_config)
 
     def default_offload_stages(self) -> tuple[tuple[str, ...], ...]:
+        """Return WAN offload stages for the loaded transformer topology."""
         pipeline_config = getattr(self.model_config, "pipeline", None)
         if pipeline_config is None or not pipeline_config.enable_offloading:
             return ()
@@ -198,6 +199,7 @@ class WanPipeline(BasePipeline):
         return _WAN_SINGLE_TRANSFORMER_OFFLOAD_STAGES
 
     def offload_pipeline_parts(self) -> dict[str, OffloadPipelinePart]:
+        """Expose text encoder and transformer block subtrees for offloading."""
         parts: dict[str, OffloadPipelinePart] = {}
         if getattr(self, "text_encoder", None) is not None:
             parts["text_encoder"] = OffloadPipelinePart(self.text_encoder)

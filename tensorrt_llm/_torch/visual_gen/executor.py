@@ -337,10 +337,12 @@ class DiffusionExecutor:
                 )
 
     def _cuda_memory_logging_enabled(self) -> bool:
+        """Return whether per-request CUDA peak memory logging is enabled."""
         pipeline_config = getattr(self.diffusion_args, "pipeline", None)
         return bool(getattr(pipeline_config, "enable_cuda_memory_logging", False))
 
     def _reset_cuda_peak_memory_stats(self) -> None:
+        """Reset CUDA peak memory stats for this worker if CUDA is available."""
         if not torch.cuda.is_available():
             return
 
@@ -353,6 +355,7 @@ class DiffusionExecutor:
             )
 
     def _log_cuda_peak_memory(self, request_id: int) -> None:
+        """Log peak CUDA memory observed for one request."""
         if not torch.cuda.is_available():
             return
 

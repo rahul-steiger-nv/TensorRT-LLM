@@ -320,16 +320,23 @@ class BasePipeline(nn.Module):
             self.transformer.post_load_weights()
 
     def default_offload_stages(self) -> tuple[OffloadPipelineStage, ...]:
-        """Return model-specific default offload stages for shorthand config."""
+        """Return model-specific offload stages requested by shorthand config.
+
+        Each stage is a tuple of part names from ``collect_offload_pipeline_parts``.
+        Parts in the same stage are staged into the GPU arena together.
+        """
         return ()
 
     def requested_offload_parts(self) -> set[str]:
+        """Return all part names referenced by the model's default stages."""
         return {part for stage in self.default_offload_stages() for part in stage}
 
     def offload_pipeline_part_owners(self) -> tuple[Any, ...]:
+        """Return objects that may advertise offloadable parts."""
         return tuple(self.modules())
 
     def collect_offload_pipeline_parts(self) -> dict[str, OffloadPipelinePart]:
+        """Collect all named offloadable module subtrees from the pipeline."""
         parts: dict[str, OffloadPipelinePart] = {}
         for owner in self.offload_pipeline_part_owners():
             if owner is None:
@@ -344,6 +351,7 @@ class BasePipeline(nn.Module):
         stages: tuple[OffloadPipelineStage, ...],
         available_parts: dict[str, OffloadPipelinePart],
     ) -> tuple[OffloadPipelineStage, ...]:
+        """Drop stage parts that are unavailable for the loaded components."""
         return tuple(
             tuple(part for part in stage if part in available_parts)
             for stage in stages
@@ -351,15 +359,18 @@ class BasePipeline(nn.Module):
         )
 
     def offload_pipeline_device(self, requested_parts: set[str]) -> torch.device:
+        """Return the staging device for requested offload parts."""
         del requested_parts
         return torch.device(self.device)
 
     def offload_context(self, group_name: str, enable: bool = True):
+        """Stage an offload group for the duration of an explicit call site."""
         if self._offload_pipeline is None or not enable:
             return nullcontext()
         return self._offload_pipeline.context(group_name)
 
     def initialize_offload_pipeline(self) -> None:
+        """Create and initialize the offload pipeline after weights are loaded."""
         configured_stages = self.default_offload_stages()
         if not configured_stages or self._offload_pipeline is not None:
             return
@@ -379,7 +390,7 @@ class BasePipeline(nn.Module):
         pipeline_config = getattr(self.model_config, "pipeline", None)
         pin_memory = bool(getattr(pipeline_config, "offload_param_pin_memory", True))
         stage_summary = " -> ".join("+".join(stage) for stage in stages)
-        logger.info("%s offload pipeline enabled: %s", self.__class__.__name__, stage_summary)
+        logger.info(f"{self.__class__.__name__} offload pipeline enabled: {stage_summary}")
         self._offload_pipeline = OffloadPipeline(
             stages=stages,
             parts=available_parts,
