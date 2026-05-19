@@ -307,6 +307,8 @@ class DiffusionExecutor:
     def process_request(self, req: DiffusionRequest):
         """Process a single request."""
         log_cuda_memory = self._cuda_memory_logging_enabled()
+        if log_cuda_memory:
+            self._reset_cuda_peak_memory_stats()
         try:
             self._merge_defaults(req)
             cache_key = self.pipeline.warmup_cache_key(
@@ -319,8 +321,6 @@ class DiffusionExecutor:
                     f"torch.compile recompilation or CUDA graph capture. "
                     f"Warmed-up shapes: {self.pipeline._warmed_up_shapes}"
                 )
-            if log_cuda_memory:
-                self._reset_cuda_peak_memory_stats()
             output = self.pipeline.infer(req)
             if log_cuda_memory:
                 self._log_cuda_peak_memory(req.request_id)
@@ -348,7 +348,7 @@ class DiffusionExecutor:
 
         try:
             torch.cuda.reset_peak_memory_stats(self.device_id)
-        except Exception as e:
+        except RuntimeError as e:
             logger.warning(
                 f"Worker {self.device_id} rank {self.rank}: "
                 f"Unable to reset CUDA peak memory stats: {e}"
@@ -365,7 +365,7 @@ class DiffusionExecutor:
                 f"Worker {self.device_id} rank {self.rank}: "
                 f"Request {request_id} peak CUDA memory: {peak_allocated / 2**30:.2f} GiB"
             )
-        except Exception as e:
+        except RuntimeError as e:
             logger.warning(
                 f"Worker {self.device_id} rank {self.rank}: "
                 f"Unable to log CUDA peak memory for request {request_id}: {e}"

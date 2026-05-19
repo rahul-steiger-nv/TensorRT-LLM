@@ -97,7 +97,7 @@ class BasePipeline(nn.Module):
             )
             return
 
-        if self.default_offload_stages():
+        if self.offload_stages():
             raise NotImplementedError(
                 "CUDA graphs are not supported with visual generation offloading yet. "
                 "Disable either cuda_graph.enable_cuda_graph or pipeline.enable_offloading."
@@ -327,9 +327,13 @@ class BasePipeline(nn.Module):
         """
         return ()
 
+    def offload_stages(self) -> tuple[OffloadPipelineStage, ...]:
+        """Return offload stages resolved from the pipeline configuration."""
+        return self.default_offload_stages()
+
     def requested_offload_parts(self) -> set[str]:
-        """Return all part names referenced by the model's default stages."""
-        return {part for stage in self.default_offload_stages() for part in stage}
+        """Return all part names referenced by the configured stages."""
+        return {part for stage in self.offload_stages() for part in stage}
 
     def offload_pipeline_part_owners(self) -> tuple[Any, ...]:
         """Return objects that may advertise offloadable parts."""
@@ -365,13 +369,21 @@ class BasePipeline(nn.Module):
 
     def offload_context(self, group_name: str, enable: bool = True):
         """Stage an offload group for the duration of an explicit call site."""
-        if self._offload_pipeline is None or not enable:
+        if not enable:
+            return nullcontext()
+        if self.offload_stages() and self._offload_pipeline is None:
+            raise RuntimeError(
+                "Visual generation offloading is configured but the offload pipeline "
+                "has not been initialized. Call initialize_offload_pipeline() after "
+                "loading weights."
+            )
+        if self._offload_pipeline is None:
             return nullcontext()
         return self._offload_pipeline.context(group_name)
 
     def initialize_offload_pipeline(self) -> None:
         """Create and initialize the offload pipeline after weights are loaded."""
-        configured_stages = self.default_offload_stages()
+        configured_stages = self.offload_stages()
         if not configured_stages or self._offload_pipeline is not None:
             return
 

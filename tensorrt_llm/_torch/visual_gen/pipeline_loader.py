@@ -282,7 +282,7 @@ class PipelineLoader:
         seen: set[int] = set()
 
         for stage in pipeline._filter_available_offload_stages(
-            pipeline.default_offload_stages(), available_parts
+            pipeline.offload_stages(), available_parts
         ):
             for part in stage:
                 offload_module = available_parts[part].module

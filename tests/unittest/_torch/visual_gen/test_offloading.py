@@ -87,6 +87,25 @@ def test_cuda_graphs_with_offload_raise_not_implemented():
         _OffloadCudaGraphPipeline(config)
 
 
+def test_offload_context_requires_initialized_pipeline_when_configured():
+    config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(),
+        cuda_graph=SimpleNamespace(enable_cuda_graph=False),
+        torch_compile=SimpleNamespace(enable_torch_compile=False),
+    )
+    pipeline = _OffloadCudaGraphPipeline(config)
+
+    with pipeline.offload_context("transformer", enable=False):
+        pass
+
+    with pytest.raises(
+        RuntimeError,
+        match="offload pipeline has not been initialized",
+    ):
+        with pipeline.offload_context("transformer"):
+            pass
+
+
 def test_initialize_reports_cpu_storage_allocation_context():
     group = _ToyModule(weight_value=1.0, bias_value=10.0)
     manager = ModuleOffloadManager(
@@ -152,7 +171,7 @@ def test_copy_to_cpu_storage_reports_tensor_context():
 
     with pytest.raises(
         RuntimeError,
-        match="Failed to copy offload tensor 'group.weight'",
+        match=r"Failed to copy offload tensor 'group\.weight'",
     ) as exc_info:
         manager._copy_group_to_cpu_storage(layout)
 
