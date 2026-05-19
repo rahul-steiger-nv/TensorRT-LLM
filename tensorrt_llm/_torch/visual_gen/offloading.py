@@ -14,12 +14,12 @@
 # limitations under the License.
 """Module parameter offloading utilities for visual generation pipelines."""
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
 import torch
 import torch.nn as nn
-from torch.utils.hooks import RemovableHandle
 
 from tensorrt_llm.logger import logger
 
@@ -43,10 +43,6 @@ class OffloadPipelinePart:
     """One model-defined offloadable module subtree."""
 
     module: nn.Module
-    hook_modules: tuple[nn.Module, ...] = ()
-
-    def modules_to_hook(self) -> tuple[nn.Module, ...]:
-        return self.hook_modules or (self.module,)
 
 
 OffloadPipelineStage = tuple[str, ...]
@@ -381,8 +377,8 @@ class ModuleOffloadManager:
         self.active_group_name = None
 
 
-class ForwardHookOffloadPipeline:
-    """Stage offload groups automatically from module forward pre-hooks."""
+class OffloadPipeline:
+    """Stage offload groups explicitly from call-site contexts."""
 
     def __init__(
         self,
@@ -398,10 +394,6 @@ class ForwardHookOffloadPipeline:
         self.parts = dict(parts)
         self.device = torch.device(device)
         self.pin_memory = pin_memory
-        self._hooks: list[RemovableHandle] = []
-        self._hook_groups: dict[int, set[str]] = {}
-        self._stage_names = tuple("+".join(stage) for stage in self.stages)
-        self._stage_hook_modules: dict[str, tuple[nn.Module, ...]] = {}
         self.manager = ModuleOffloadManager(
             groups=self._build_groups(),
             device=self.device,
@@ -411,7 +403,8 @@ class ForwardHookOffloadPipeline:
     def _build_groups(self) -> list[_OffloadGroup]:
         groups: list[_OffloadGroup] = []
         seen_names: set[str] = set()
-        for stage, group_name in zip(self.stages, self._stage_names, strict=True):
+        for stage in self.stages:
+            group_name = self._stage_name(stage)
             if not stage:
                 raise ValueError("Offload pipeline stages must have at least one part")
             if group_name in seen_names:
@@ -419,7 +412,6 @@ class ForwardHookOffloadPipeline:
             seen_names.add(group_name)
 
             modules: list[nn.Module] = []
-            hook_modules: list[nn.Module] = []
             for part_name in stage:
                 try:
                     part = self.parts[part_name]
@@ -429,57 +421,22 @@ class ForwardHookOffloadPipeline:
                         f"'{group_name}'. Available parts: {sorted(self.parts)}"
                     ) from e
                 modules.append(part.module)
-                hook_modules.extend(part.modules_to_hook())
 
             group_module = modules[0] if len(modules) == 1 else nn.ModuleList(modules)
             groups.append(_OffloadGroup(group_name, group_module))
-            self._stage_hook_modules[group_name] = self._unique_modules(hook_modules)
 
         return groups
 
-    @staticmethod
-    def _unique_modules(modules: Sequence[nn.Module]) -> tuple[nn.Module, ...]:
-        unique: list[nn.Module] = []
-        seen: set[int] = set()
-        for module in modules:
-            module_id = id(module)
-            if module_id in seen:
-                continue
-            unique.append(module)
-            seen.add(module_id)
-        return tuple(unique)
-
     def initialize(self) -> None:
         self.manager.initialize()
-        self._register_hooks()
 
-    def _register_hooks(self) -> None:
-        if self._hooks:
-            return
+    @staticmethod
+    def _stage_name(stage: Sequence[str] | str) -> str:
+        return stage if isinstance(stage, str) else "+".join(stage)
 
-        for group_name in self._stage_names:
-            for module in self._stage_hook_modules[group_name]:
-                module_id = id(module)
-                groups = self._hook_groups.setdefault(module_id, set())
-                if groups and group_name not in groups:
-                    logger.warning(
-                        "Registering multiple offload groups %s on module %s",
-                        sorted([*groups, group_name]),
-                        module.__class__.__name__,
-                    )
-                groups.add(group_name)
-
-                def stage_group(_module, _args, group_name=group_name):
-                    self.manager.stage(group_name)
-
-                self._hooks.append(module.register_forward_pre_hook(stage_group))
-
-    def remove_hooks(self) -> None:
-        for handle in self._hooks:
-            handle.remove()
-        self._hooks.clear()
-        self._hook_groups.clear()
+    def context(self, group_name: str):
+        self.manager.stage(group_name)
+        return nullcontext()
 
     def cleanup(self) -> None:
-        self.remove_hooks()
         self.manager._deactivate_active_group()

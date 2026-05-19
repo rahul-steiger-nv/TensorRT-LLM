@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 import itertools
 import os
 import time
@@ -18,7 +19,7 @@ from .checkpoints import WeightLoader
 from .config import PipelineComponent
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
-from .offloading import ForwardHookOffloadPipeline, OffloadPipelinePart, OffloadPipelineStage
+from .offloading import OffloadPipeline, OffloadPipelinePart, OffloadPipelineStage
 
 
 class ExtraParamSchema(StrictBaseModel):
@@ -63,7 +64,7 @@ class BasePipeline(nn.Module):
         self.config = model_config.pretrained_config
         self.mapping: Mapping = getattr(model_config, "mapping", None) or Mapping()
         self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
-        self._offload_pipeline: Optional[ForwardHookOffloadPipeline] = None
+        self._offload_pipeline: Optional[OffloadPipeline] = None
         self._parallel_vae_enabled: bool = False
         self._warmed_up_shapes: Set[tuple] = set()
 
@@ -347,6 +348,11 @@ class BasePipeline(nn.Module):
         del requested_parts
         return torch.device(self.device)
 
+    def offload_context(self, group_name: str, enable: bool = True):
+        if self._offload_pipeline is None or not enable:
+            return nullcontext()
+        return self._offload_pipeline.context(group_name)
+
     def initialize_offload_pipeline(self) -> None:
         configured_stages = self.default_offload_stages()
         if not configured_stages or self._offload_pipeline is not None:
@@ -362,7 +368,7 @@ class BasePipeline(nn.Module):
         pin_memory = bool(getattr(pipeline_config, "offload_param_pin_memory", True))
         stage_summary = " -> ".join("+".join(stage) for stage in stages)
         logger.info("%s offload pipeline enabled: %s", self.__class__.__name__, stage_summary)
-        self._offload_pipeline = ForwardHookOffloadPipeline(
+        self._offload_pipeline = OffloadPipeline(
             stages=stages,
             parts=available_parts,
             device=self.offload_pipeline_device(requested_parts),

@@ -204,10 +204,7 @@ class WanPipeline(BasePipeline):
         for name in self.transformer_components:
             transformer = getattr(self, name, None)
             if transformer is not None:
-                parts[f"{name}.blocks"] = OffloadPipelinePart(
-                    module=transformer.blocks,
-                    hook_modules=tuple(transformer.blocks),
-                )
+                parts[f"{name}.blocks"] = OffloadPipelinePart(module=transformer.blocks)
         return parts
 
     def load_standard_components(
@@ -536,6 +533,7 @@ class WanPipeline(BasePipeline):
             current_t = timestep if timestep.dim() == 0 else timestep[0]
 
             # Select model based on timestep (if two-stage denoising is enabled)
+            offload_stage = "transformer.blocks"
             if boundary_timestep is not None and self.transformer_2 is not None:
                 if current_t >= boundary_timestep:
                     current_model = self.transformer
@@ -543,6 +541,7 @@ class WanPipeline(BasePipeline):
                 else:
                     current_model = self.transformer_2
                     model_name = "transformer_2 (low-noise)"
+                    offload_stage = "transformer_2.blocks"
 
                 # Log when switching models
                 if last_model_used[0] != model_name:
@@ -566,11 +565,12 @@ class WanPipeline(BasePipeline):
                     # T2V: current_t for all frames
                     timestep = current_t.reshape(1, 1).expand(latents.shape[0], nf * nh * nw)
 
-            return current_model(
-                hidden_states=latents,
-                timestep=timestep,
-                encoder_hidden_states=encoder_hidden_states,
-            )
+            with self.offload_context(offload_stage):
+                return current_model(
+                    hidden_states=latents,
+                    timestep=timestep,
+                    encoder_hidden_states=encoder_hidden_states,
+                )
 
         # Pin reference image to latent after each scheduler step (Wan 2.2 5B I2V only)
         def _pin_i2v_first_frame(x):
@@ -623,7 +623,8 @@ class WanPipeline(BasePipeline):
             input_ids = text_inputs.input_ids.to(self.device)
             attention_mask = text_inputs.attention_mask.to(self.device)
 
-            embeds = self.text_encoder(input_ids, attention_mask=attention_mask).last_hidden_state
+            with self.offload_context("text_encoder"):
+                embeds = self.text_encoder(input_ids, attention_mask=attention_mask).last_hidden_state
             embeds = embeds.to(self.dtype)
 
             # Zero-out padded tokens based on mask

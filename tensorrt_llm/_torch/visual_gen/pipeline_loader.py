@@ -189,7 +189,7 @@ class PipelineLoader:
             pipeline = AutoPipeline.from_config(config, checkpoint_dir)
 
         # Convert meta tensors to their runtime devices. Offloaded submodules
-        # stay on CPU until the forward-hook offload pipeline stages them.
+        # stay on CPU until the explicit offload context stages them.
         cpu_offload_modules = self._get_load_time_cpu_offload_modules(pipeline)
         self._materialize_meta_tensors(pipeline, cpu_offload_modules)
 

@@ -17,7 +17,12 @@
 import torch
 import torch.nn as nn
 
-from tensorrt_llm._torch.visual_gen.offloading import _OffloadGroup, ModuleOffloadManager
+from tensorrt_llm._torch.visual_gen.offloading import (
+    _OffloadGroup,
+    ModuleOffloadManager,
+    OffloadPipeline,
+    OffloadPipelinePart,
+)
 
 
 class _ToyModule(nn.Module):
@@ -45,6 +50,29 @@ def _make_manager() -> tuple[ModuleOffloadManager, _ToyModule, _ToyModule]:
 
 def _storage_ptr(tensor: torch.Tensor) -> int:
     return tensor.untyped_storage().data_ptr()
+
+
+def test_offload_pipeline_context_stages_requested_group():
+    group_a = _ToyModule(weight_value=1.0, bias_value=10.0)
+    group_b = _ToyModule(weight_value=2.0, bias_value=20.0)
+    pipeline = OffloadPipeline(
+        stages=(("group_a",), ("group_b",)),
+        parts={
+            "group_a": OffloadPipelinePart(group_a),
+            "group_b": OffloadPipelinePart(group_b),
+        },
+        device="cpu",
+        pin_memory=False,
+    )
+    pipeline.initialize()
+
+    assert pipeline.manager.active_group_name is None
+    with pipeline.context("group_a"):
+        assert pipeline.manager.active_group_name == "group_a"
+    assert pipeline.manager.active_group_name == "group_a"
+
+    with pipeline.context("group_b"):
+        assert pipeline.manager.active_group_name == "group_b"
 
 
 def test_inactive_group_stays_cpu_backed_after_staging_another_group():
