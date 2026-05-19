@@ -14,6 +14,9 @@
 # limitations under the License.
 """Tests for visual generation module parameter offloading."""
 
+from unittest.mock import patch
+
+import pytest
 import torch
 import torch.nn as nn
 
@@ -49,6 +52,81 @@ def _make_manager() -> tuple[ModuleOffloadManager, _ToyModule, _ToyModule]:
 
 def _storage_ptr(tensor: torch.Tensor) -> int:
     return tensor.untyped_storage().data_ptr()
+
+
+def test_initialize_reports_cpu_storage_allocation_context():
+    group = _ToyModule(weight_value=1.0, bias_value=10.0)
+    manager = ModuleOffloadManager(
+        groups={"group": group},
+        device="cpu",
+        pin_memory=False,
+    )
+
+    def fail_cpu_storage(*args, **kwargs):
+        raise RuntimeError("cpu allocation failed")
+
+    with patch("torch.empty", side_effect=fail_cpu_storage):
+        with pytest.raises(
+            RuntimeError,
+            match="Failed to allocate packed CPU storage for visual generation offload",
+        ) as exc_info:
+            manager.initialize()
+
+    message = str(exc_info.value)
+    assert "Failed to allocate packed CPU storage for visual generation offload" in message
+    assert "pin_memory=False" in message
+    assert "groups=[group=" in message
+
+
+def test_initialize_reports_cuda_arena_allocation_hint():
+    group = _ToyModule(weight_value=1.0, bias_value=10.0)
+    manager = ModuleOffloadManager(
+        groups={"group": group},
+        device="cuda",
+        pin_memory=False,
+    )
+    original_empty = torch.empty
+
+    def fail_cuda_arena(*args, **kwargs):
+        device = torch.device(kwargs.get("device", "cpu"))
+        if device.type == "cuda":
+            raise RuntimeError("cuda allocation failed")
+        return original_empty(*args, **kwargs)
+
+    with patch("torch.empty", side_effect=fail_cuda_arena):
+        with pytest.raises(
+            RuntimeError,
+            match="Failed to allocate GPU arena for visual generation offload",
+        ) as exc_info:
+            manager.initialize()
+
+    message = str(exc_info.value)
+    assert "Failed to allocate GPU arena for visual generation offload" in message
+    assert "device=cuda" in message
+    assert "groups=[group=" in message
+    assert "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" in message
+
+
+def test_copy_to_cpu_storage_reports_tensor_context():
+    group = _ToyModule(weight_value=1.0, bias_value=10.0)
+    manager = ModuleOffloadManager(
+        groups={"group": group},
+        device="cpu",
+        pin_memory=False,
+    )
+    layout = manager._collect_group_layout("group", group, 0)
+    manager.cpu_storage = torch.empty(0, dtype=torch.uint8, device="cpu")
+
+    with pytest.raises(
+        RuntimeError,
+        match="Failed to copy offload tensor 'group.weight'",
+    ) as exc_info:
+        manager._copy_group_to_cpu_storage(layout)
+
+    message = str(exc_info.value)
+    assert "Failed to copy offload tensor 'group.weight'" in message
+    assert "to packed CPU storage at offset 0" in message
+    assert "dtype=torch.float32" in message
 
 
 def test_offload_pipeline_context_stages_requested_group():

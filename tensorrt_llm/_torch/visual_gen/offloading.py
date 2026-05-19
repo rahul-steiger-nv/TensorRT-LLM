@@ -260,9 +260,55 @@ class ModuleOffloadManager:
         for spec in layout.specs:
             if spec.nbytes == 0:
                 continue
-            tensor = getattr(spec.owner, spec.name).detach()
-            tensor_bytes = tensor.reshape(-1).view(torch.uint8).cpu()
-            self.cpu_storage.narrow(0, spec.cpu_offset, spec.nbytes).copy_(tensor_bytes)
+            try:
+                tensor = getattr(spec.owner, spec.name).detach()
+                tensor_bytes = tensor.reshape(-1).view(torch.uint8).cpu()
+                self.cpu_storage.narrow(0, spec.cpu_offset, spec.nbytes).copy_(tensor_bytes)
+            except RuntimeError as e:
+                raise RuntimeError(
+                    f"Failed to copy offload tensor '{spec.qualified_name}' "
+                    f"({_format_bytes(spec.nbytes)}, shape={spec.shape}, dtype={spec.dtype}) "
+                    f"to packed CPU storage at offset {spec.cpu_offset}."
+                ) from e
+
+    def _group_size_summary(self) -> str:
+        return ", ".join(
+            f"{name}={_format_bytes(layout.nbytes)}" for name, layout in self.layouts.items()
+        )
+
+    def _cuda_allocation_hint(self) -> str:
+        if self.device.type != "cuda":
+            return ""
+        return (
+            " If this is due to CUDA memory fragmentation, try setting "
+            "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True before starting the process."
+        )
+
+    def _allocate_cpu_storage(self, num_bytes: int) -> torch.Tensor:
+        try:
+            return torch.empty(
+                num_bytes,
+                dtype=torch.uint8,
+                device="cpu",
+                pin_memory=self.pin_memory,
+            )
+        except RuntimeError as e:
+            raise RuntimeError(
+                "Failed to allocate packed CPU storage for visual generation offload "
+                f"({_format_bytes(num_bytes)}, {num_bytes} bytes, "
+                f"pin_memory={self.pin_memory}, groups=[{self._group_size_summary()}])."
+            ) from e
+
+    def _allocate_gpu_arena(self, num_bytes: int) -> torch.Tensor:
+        try:
+            return torch.empty(num_bytes, dtype=torch.uint8, device=self.device)
+        except RuntimeError as e:
+            raise RuntimeError(
+                "Failed to allocate GPU arena for visual generation offload "
+                f"({_format_bytes(num_bytes)}, {num_bytes} bytes, "
+                f"device={self.device}, groups=[{self._group_size_summary()}])."
+                f"{self._cuda_allocation_hint()}"
+            ) from e
 
     def _typed_view(self, storage: torch.Tensor, offset: int, spec: _FlatTensorSpec) -> torch.Tensor:
         byte_view = storage.narrow(0, offset, spec.nbytes)
@@ -310,27 +356,19 @@ class ModuleOffloadManager:
 
         total_cpu_bytes = _align_offset(cpu_offset)
         max_gpu_bytes = max(layout.nbytes for layout in self.layouts.values())
-        group_sizes = ", ".join(
-            f"{name}={_format_bytes(layout.nbytes)}" for name, layout in self.layouts.items()
-        )
         logger.info(
             "Module offload storage layout: "
             f"cpu_total={_format_bytes(total_cpu_bytes)}, "
             f"gpu_arena={_format_bytes(max_gpu_bytes)}, "
-            f"groups=[{group_sizes}], device={self.device}"
+            f"groups=[{self._group_size_summary()}], device={self.device}"
         )
 
-        self.cpu_storage = torch.empty(
-            total_cpu_bytes,
-            dtype=torch.uint8,
-            device="cpu",
-            pin_memory=self.pin_memory,
-        )
+        self.cpu_storage = self._allocate_cpu_storage(total_cpu_bytes)
 
         for layout in self.layouts.values():
             self._copy_group_to_cpu_storage(layout)
 
-        self.gpu_arena = torch.empty(max_gpu_bytes, dtype=torch.uint8, device=self.device)
+        self.gpu_arena = self._allocate_gpu_arena(max_gpu_bytes)
 
         for name, layout in self.layouts.items():
             assert self.cpu_storage is not None
