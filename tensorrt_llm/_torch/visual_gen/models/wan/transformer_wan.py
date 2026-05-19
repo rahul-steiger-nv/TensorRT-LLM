@@ -14,7 +14,6 @@ from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
-from tensorrt_llm._torch.visual_gen.offloading import OffloadPipelinePart
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -599,14 +598,6 @@ class WanTransformer3DModel(nn.Module):
     @property
     def device(self):
         return get_parameter_device(self)
-
-    def offload_pipeline_parts(self) -> dict[str, OffloadPipelinePart]:
-        return {
-            "transformer.blocks": OffloadPipelinePart(
-                module=self.blocks,
-                hook_modules=tuple(self.blocks),
-            ),
-        }
 
     def __post_init__(self):
         self.apply_quant_config_exclude_modules()

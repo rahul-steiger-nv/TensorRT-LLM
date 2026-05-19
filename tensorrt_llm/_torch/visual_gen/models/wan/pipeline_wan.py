@@ -79,9 +79,14 @@ WAN_DEFAULT_NEGATIVE_PROMPT = (
     "fused fingers, motionless image, cluttered background, three legs, many people in the background, walking backward"
 )
 
-_WAN_T2V_OFFLOAD_STAGES = (
+_WAN_SINGLE_TRANSFORMER_OFFLOAD_STAGES = (
     ("text_encoder",),
     ("transformer.blocks",),
+)
+_WAN_TWO_TRANSFORMER_OFFLOAD_STAGES = (
+    ("text_encoder",),
+    ("transformer.blocks",),
+    ("transformer_2.blocks",),
 )
 
 
@@ -183,22 +188,26 @@ class WanPipeline(BasePipeline):
 
     def default_offload_stages(self) -> tuple[tuple[str, ...], ...]:
         pipeline_config = getattr(self.model_config, "pipeline", None)
-        if pipeline_config is None:
+        if pipeline_config is None or not pipeline_config.enable_offloading:
             return ()
-        if self.is_wan22_14b or self.is_wan22_5b:
+        if pipeline_config.offload_device != "cpu":
             return ()
 
-        if bool(
-            getattr(pipeline_config, "enable_offloading", False)
-            and getattr(pipeline_config, "offload_device", "cpu") == "cpu"
-        ):
-            return _WAN_T2V_OFFLOAD_STAGES
-        return ()
+        if self.is_wan22_14b:
+            return _WAN_TWO_TRANSFORMER_OFFLOAD_STAGES
+        return _WAN_SINGLE_TRANSFORMER_OFFLOAD_STAGES
 
     def offload_pipeline_parts(self) -> dict[str, OffloadPipelinePart]:
         parts: dict[str, OffloadPipelinePart] = {}
         if getattr(self, "text_encoder", None) is not None:
             parts["text_encoder"] = OffloadPipelinePart(self.text_encoder)
+        for name in self.transformer_components:
+            transformer = getattr(self, name, None)
+            if transformer is not None:
+                parts[f"{name}.blocks"] = OffloadPipelinePart(
+                    module=transformer.blocks,
+                    hook_modules=tuple(transformer.blocks),
+                )
         return parts
 
     def load_standard_components(
