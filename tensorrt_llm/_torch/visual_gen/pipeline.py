@@ -97,6 +97,12 @@ class BasePipeline(nn.Module):
             )
             return
 
+        if self.default_offload_stages():
+            raise NotImplementedError(
+                "CUDA graphs are not supported with visual generation offloading yet. "
+                "Disable either cuda_graph.enable_cuda_graph or pipeline.enable_offloading."
+            )
+
         if len(self.transformer_components) > 1:
             logger.info(
                 "CUDA graph runner: multiple transformer components, using shared graph pool"
@@ -362,6 +368,12 @@ class BasePipeline(nn.Module):
         stages = self._filter_available_offload_stages(configured_stages, available_parts)
         if not stages:
             return
+
+        if self._cuda_graph_runners:
+            raise NotImplementedError(
+                "CUDA graphs are not supported with visual generation offloading yet. "
+                "Disable either cuda_graph.enable_cuda_graph or pipeline.enable_offloading."
+            )
 
         requested_parts = {part for stage in stages for part in stage}
         pipeline_config = getattr(self.model_config, "pipeline", None)

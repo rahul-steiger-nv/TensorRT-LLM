@@ -14,12 +14,14 @@
 # limitations under the License.
 """Tests for visual generation module parameter offloading."""
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 import torch.nn as nn
 
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.offloading import (
     ModuleOffloadManager,
     OffloadPipeline,
@@ -33,6 +35,15 @@ class _ToyModule(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.full((2, 2), weight_value))
         self.register_buffer("bias", torch.full((2,), bias_value))
+
+
+class _OffloadCudaGraphPipeline(BasePipeline):
+
+    def _init_transformer(self) -> None:
+        self.transformer = _ToyModule(weight_value=1.0, bias_value=10.0)
+
+    def default_offload_stages(self) -> tuple[tuple[str, ...], ...]:
+        return (("transformer",),)
 
 
 def _make_manager() -> tuple[ModuleOffloadManager, _ToyModule, _ToyModule]:
@@ -52,6 +63,20 @@ def _make_manager() -> tuple[ModuleOffloadManager, _ToyModule, _ToyModule]:
 
 def _storage_ptr(tensor: torch.Tensor) -> int:
     return tensor.untyped_storage().data_ptr()
+
+
+def test_cuda_graphs_with_offload_raise_not_implemented():
+    config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(),
+        cuda_graph=SimpleNamespace(enable_cuda_graph=True),
+        torch_compile=SimpleNamespace(enable_torch_compile=False),
+    )
+
+    with pytest.raises(
+        NotImplementedError,
+        match="CUDA graphs are not supported with visual generation offloading",
+    ):
+        _OffloadCudaGraphPipeline(config)
 
 
 def test_initialize_reports_cpu_storage_allocation_context():
