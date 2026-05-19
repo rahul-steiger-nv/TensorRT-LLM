@@ -33,12 +33,6 @@ def _format_bytes(num_bytes: int) -> str:
 
 
 @dataclass(frozen=True)
-class _OffloadGroup:
-    name: str
-    module: nn.Module
-
-
-@dataclass(frozen=True)
 class OffloadPipelinePart:
     """One model-defined offloadable module subtree."""
 
@@ -66,16 +60,13 @@ class _FlatTensorSpec:
 
 @dataclass
 class _GroupLayout:
-    group: _OffloadGroup
+    name: str
+    module: nn.Module
     cpu_offset: int
     nbytes: int
     specs: list[_FlatTensorSpec]
-
-
-@dataclass(frozen=True)
-class _CachedGroupViews:
-    cpu: tuple[nn.Parameter | torch.Tensor, ...]
-    gpu: tuple[nn.Parameter | torch.Tensor, ...]
+    cpu_views: tuple[nn.Parameter | torch.Tensor, ...] = ()
+    gpu_views: tuple[nn.Parameter | torch.Tensor, ...] = ()
 
 
 class ModuleOffloadManager:
@@ -83,31 +74,26 @@ class ModuleOffloadManager:
 
     def __init__(
         self,
-        groups: Sequence[_OffloadGroup],
+        groups: Mapping[str, nn.Module],
         device: torch.device | str,
         pin_memory: bool = True,
     ) -> None:
         if not groups:
             raise ValueError("At least one offload group must be provided")
 
-        self.groups = list(groups)
+        self.groups = dict(groups)
         self.device = torch.device(device)
         self.pin_memory = pin_memory
         self.cpu_storage: torch.Tensor | None = None
         self.gpu_arena: torch.Tensor | None = None
         self.layouts: dict[str, _GroupLayout] = {}
-        self._cached_views: dict[str, _CachedGroupViews] = {}
         self.active_group_name: str | None = None
 
-        seen_names: set[str] = set()
-        for group in self.groups:
-            if not group.name:
+        for name, module in self.groups.items():
+            if not name:
                 raise ValueError("Offload group names must be non-empty")
-            if group.name in seen_names:
-                raise ValueError(f"Duplicate offload group name: {group.name}")
-            if not isinstance(group.module, nn.Module):
-                raise TypeError(f"Offload group '{group.name}' must contain an nn.Module")
-            seen_names.add(group.name)
+            if not isinstance(module, nn.Module):
+                raise TypeError(f"Offload group '{name}' must contain an nn.Module")
 
     @staticmethod
     def _owner_and_name(root: nn.Module, qualified_name: str) -> tuple[nn.Module, str]:
@@ -149,7 +135,8 @@ class ModuleOffloadManager:
 
     def _build_spec(
         self,
-        group: _OffloadGroup,
+        group_name: str,
+        group_module: nn.Module,
         qualified_name: str,
         tensor: torch.Tensor,
         is_parameter: bool,
@@ -157,14 +144,14 @@ class ModuleOffloadManager:
         gpu_offset: int,
         absolute_cpu_offset: int | None = None,
     ) -> _FlatTensorSpec:
-        display_name = f"{group.name}.{qualified_name}"
+        display_name = f"{group_name}.{qualified_name}"
         if not tensor.is_contiguous():
             raise ValueError(
                 f"Cannot offload non-contiguous tensor '{display_name}' "
                 f"with stride {tuple(tensor.stride())}"
             )
 
-        owner, name = self._owner_and_name(group.module, qualified_name)
+        owner, name = self._owner_and_name(group_module, qualified_name)
         return _FlatTensorSpec(
             owner=owner,
             name=name,
@@ -180,68 +167,89 @@ class ModuleOffloadManager:
             nbytes=self._tensor_nbytes(tensor),
         )
 
-    def _collect_group_layout(self, group: _OffloadGroup, cpu_offset: int) -> _GroupLayout:
+    def _group_tensors(
+        self, group_module: nn.Module
+    ) -> list[tuple[str, torch.Tensor, bool]]:
+        tensors: list[tuple[str, torch.Tensor, bool]] = []
+        tensors.extend(
+            (qualified_name, param.detach(), True)
+            for qualified_name, param in group_module.named_parameters(
+                recurse=True,
+                remove_duplicate=False,
+            )
+        )
+        tensors.extend(
+            (qualified_name, buffer.detach(), False)
+            for qualified_name, buffer in group_module.named_buffers(
+                recurse=True,
+                remove_duplicate=False,
+            )
+        )
+        return tensors
+
+    def _append_layout_spec(
+        self,
+        group_name: str,
+        group_module: nn.Module,
+        qualified_name: str,
+        tensor: torch.Tensor,
+        is_parameter: bool,
+        cpu_offset: int,
+        gpu_offset: int,
+        seen_tensors: dict[tuple[int, int], _FlatTensorSpec],
+        specs: list[_FlatTensorSpec],
+    ) -> int:
+        display_name = f"{group_name}.{qualified_name}"
+        alias = self._get_alias_spec(seen_tensors, tensor, display_name)
+        if alias is None:
+            gpu_offset = _align_offset(gpu_offset, tensor.element_size())
+
+        spec = self._build_spec(
+            group_name=group_name,
+            group_module=group_module,
+            qualified_name=qualified_name,
+            tensor=tensor,
+            is_parameter=is_parameter,
+            cpu_offset=cpu_offset,
+            gpu_offset=alias.gpu_offset if alias is not None else gpu_offset,
+            absolute_cpu_offset=alias.cpu_offset if alias is not None else None,
+        )
+        specs.append(spec)
+
+        if alias is not None:
+            return gpu_offset
+
+        key = self._storage_key(tensor)
+        if key is not None:
+            seen_tensors[key] = spec
+        return gpu_offset + spec.nbytes
+
+    def _collect_group_layout(
+        self, group_name: str, group_module: nn.Module, cpu_offset: int
+    ) -> _GroupLayout:
         gpu_offset = 0
         specs: list[_FlatTensorSpec] = []
         seen_tensors: dict[tuple[int, int], _FlatTensorSpec] = {}
 
-        for qualified_name, param in group.module.named_parameters(
-            recurse=True,
-            remove_duplicate=False,
-        ):
-            tensor = param.detach()
-            display_name = f"{group.name}.{qualified_name}"
-            alias = self._get_alias_spec(seen_tensors, tensor, display_name)
-            if alias is None:
-                gpu_offset = _align_offset(gpu_offset, tensor.element_size())
-            specs.append(
-                self._build_spec(
-                    group=group,
-                    qualified_name=qualified_name,
-                    tensor=tensor,
-                    is_parameter=True,
-                    cpu_offset=cpu_offset,
-                    gpu_offset=alias.gpu_offset if alias is not None else gpu_offset,
-                    absolute_cpu_offset=alias.cpu_offset if alias is not None else None,
-                )
+        for qualified_name, tensor, is_parameter in self._group_tensors(group_module):
+            gpu_offset = self._append_layout_spec(
+                group_name=group_name,
+                group_module=group_module,
+                qualified_name=qualified_name,
+                tensor=tensor,
+                is_parameter=is_parameter,
+                cpu_offset=cpu_offset,
+                gpu_offset=gpu_offset,
+                seen_tensors=seen_tensors,
+                specs=specs,
             )
-            if alias is None:
-                key = self._storage_key(tensor)
-                if key is not None:
-                    seen_tensors[key] = specs[-1]
-                gpu_offset += specs[-1].nbytes
-
-        for qualified_name, buffer in group.module.named_buffers(
-            recurse=True,
-            remove_duplicate=False,
-        ):
-            tensor = buffer.detach()
-            display_name = f"{group.name}.{qualified_name}"
-            alias = self._get_alias_spec(seen_tensors, tensor, display_name)
-            if alias is None:
-                gpu_offset = _align_offset(gpu_offset, tensor.element_size())
-            specs.append(
-                self._build_spec(
-                    group=group,
-                    qualified_name=qualified_name,
-                    tensor=tensor,
-                    is_parameter=False,
-                    cpu_offset=cpu_offset,
-                    gpu_offset=alias.gpu_offset if alias is not None else gpu_offset,
-                    absolute_cpu_offset=alias.cpu_offset if alias is not None else None,
-                )
-            )
-            if alias is None:
-                key = self._storage_key(tensor)
-                if key is not None:
-                    seen_tensors[key] = specs[-1]
-                gpu_offset += specs[-1].nbytes
 
         if not specs:
-            raise ValueError(f"Offload group '{group.name}' has no parameters or buffers")
+            raise ValueError(f"Offload group '{group_name}' has no parameters or buffers")
 
         return _GroupLayout(
-            group=group,
+            name=group_name,
+            module=group_module,
             cpu_offset=cpu_offset,
             nbytes=_align_offset(gpu_offset),
             specs=specs,
@@ -295,9 +303,9 @@ class ModuleOffloadManager:
             raise RuntimeError("ModuleOffloadManager has already been initialized")
 
         cpu_offset = 0
-        for group in self.groups:
-            layout = self._collect_group_layout(group, cpu_offset)
-            self.layouts[group.name] = layout
+        for name, module in self.groups.items():
+            layout = self._collect_group_layout(name, module, cpu_offset)
+            self.layouts[name] = layout
             cpu_offset = _align_offset(layout.cpu_offset + layout.nbytes)
 
         total_cpu_bytes = _align_offset(cpu_offset)
@@ -327,12 +335,9 @@ class ModuleOffloadManager:
         for name, layout in self.layouts.items():
             assert self.cpu_storage is not None
             assert self.gpu_arena is not None
-            cached_views = _CachedGroupViews(
-                cpu=self._make_views(layout, self.cpu_storage, use_gpu_offsets=False),
-                gpu=self._make_views(layout, self.gpu_arena, use_gpu_offsets=True),
-            )
-            self._cached_views[name] = cached_views
-            self._bind_views(layout, cached_views.cpu)
+            layout.cpu_views = self._make_views(layout, self.cpu_storage, use_gpu_offsets=False)
+            layout.gpu_views = self._make_views(layout, self.gpu_arena, use_gpu_offsets=True)
+            self._rebind_to_cpu(name)
 
     def _get_layout(self, name: str) -> _GroupLayout:
         try:
@@ -346,7 +351,7 @@ class ModuleOffloadManager:
         layout = self._get_layout(name)
         if self.active_group_name == name:
             return
-        if self.cpu_storage is None or self.gpu_arena is None or not self._cached_views:
+        if self.cpu_storage is None or self.gpu_arena is None:
             raise RuntimeError("ModuleOffloadManager must be initialized before staging")
 
         self._deactivate_active_group()
@@ -362,18 +367,26 @@ class ModuleOffloadManager:
                 f"Failed to stage offload group '{name}' ({_format_bytes(layout.nbytes)}) "
                 f"to {self.device}"
             ) from e
-        self._bind_views(layout, self._cached_views[name].gpu)
+        self._rebind_to_gpu(name)
         self.active_group_name = name
+
+    def _rebind_to_cpu(self, name: str) -> None:
+        layout = self._get_layout(name)
+        if not layout.cpu_views:
+            raise RuntimeError("ModuleOffloadManager must be initialized before staging")
+        self._bind_views(layout, layout.cpu_views)
+
+    def _rebind_to_gpu(self, name: str) -> None:
+        layout = self._get_layout(name)
+        if not layout.gpu_views:
+            raise RuntimeError("ModuleOffloadManager must be initialized before staging")
+        self._bind_views(layout, layout.gpu_views)
 
     def _deactivate_active_group(self) -> None:
         if self.active_group_name is None:
             return
-        if not self._cached_views:
-            raise RuntimeError("ModuleOffloadManager must be initialized before staging")
 
-        active_name = self.active_group_name
-        active_layout = self._get_layout(active_name)
-        self._bind_views(active_layout, self._cached_views[active_name].cpu)
+        self._rebind_to_cpu(self.active_group_name)
         self.active_group_name = None
 
 
@@ -400,16 +413,14 @@ class OffloadPipeline:
             pin_memory=self.pin_memory,
         )
 
-    def _build_groups(self) -> list[_OffloadGroup]:
-        groups: list[_OffloadGroup] = []
-        seen_names: set[str] = set()
+    def _build_groups(self) -> dict[str, nn.Module]:
+        groups: dict[str, nn.Module] = {}
         for stage in self.stages:
             group_name = self._stage_name(stage)
             if not stage:
                 raise ValueError("Offload pipeline stages must have at least one part")
-            if group_name in seen_names:
+            if group_name in groups:
                 raise ValueError(f"Duplicate offload pipeline stage: {group_name}")
-            seen_names.add(group_name)
 
             modules: list[nn.Module] = []
             for part_name in stage:
@@ -423,7 +434,7 @@ class OffloadPipeline:
                 modules.append(part.module)
 
             group_module = modules[0] if len(modules) == 1 else nn.ModuleList(modules)
-            groups.append(_OffloadGroup(group_name, group_module))
+            groups[group_name] = group_module
 
         return groups
 

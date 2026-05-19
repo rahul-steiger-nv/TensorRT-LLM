@@ -18,7 +18,6 @@ import torch
 import torch.nn as nn
 
 from tensorrt_llm._torch.visual_gen.offloading import (
-    _OffloadGroup,
     ModuleOffloadManager,
     OffloadPipeline,
     OffloadPipelinePart,
@@ -37,10 +36,10 @@ def _make_manager() -> tuple[ModuleOffloadManager, _ToyModule, _ToyModule]:
     group_a = _ToyModule(weight_value=1.0, bias_value=10.0)
     group_b = _ToyModule(weight_value=2.0, bias_value=20.0)
     manager = ModuleOffloadManager(
-        groups=[
-            _OffloadGroup("group_a", group_a),
-            _OffloadGroup("group_b", group_b),
-        ],
+        groups={
+            "group_a": group_a,
+            "group_b": group_b,
+        },
         device="cpu",
         pin_memory=False,
     )
