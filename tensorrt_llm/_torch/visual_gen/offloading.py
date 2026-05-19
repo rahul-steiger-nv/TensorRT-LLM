@@ -32,6 +32,9 @@ def _format_bytes(num_bytes: int) -> str:
     return f"{num_bytes / (1024**3):.2f} GiB"
 
 
+_PACKED_TENSOR_ALIGNMENT = 16
+
+
 @dataclass(frozen=True)
 class OffloadPipelinePart:
     """One model-defined offloadable module subtree."""
@@ -202,7 +205,7 @@ class ModuleOffloadManager:
         display_name = f"{group_name}.{qualified_name}"
         alias = self._get_alias_spec(seen_tensors, tensor, display_name)
         if alias is None:
-            gpu_offset = _align_offset(gpu_offset, tensor.element_size())
+            gpu_offset = _align_offset(gpu_offset, _PACKED_TENSOR_ALIGNMENT)
 
         spec = self._build_spec(
             group_name=group_name,

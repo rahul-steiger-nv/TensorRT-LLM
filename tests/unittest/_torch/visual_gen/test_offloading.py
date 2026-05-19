@@ -37,6 +37,14 @@ class _ToyModule(nn.Module):
         self.register_buffer("bias", torch.full((2,), bias_value))
 
 
+class _AlignmentToyModule(nn.Module):
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.prefix = nn.Parameter(torch.ones((1,), dtype=torch.bfloat16))
+        self.alignment_sensitive = nn.Parameter(torch.ones((3,), dtype=torch.bfloat16))
+
+
 class _OffloadCudaGraphPipeline(BasePipeline):
 
     def _init_transformer(self) -> None:
@@ -152,6 +160,25 @@ def test_copy_to_cpu_storage_reports_tensor_context():
     assert "Failed to copy offload tensor 'group.weight'" in message
     assert "to packed CPU storage at offset 0" in message
     assert "dtype=torch.float32" in message
+
+
+def test_packed_tensor_views_are_sufficiently_aligned():
+    group = _AlignmentToyModule()
+    manager = ModuleOffloadManager(
+        groups={"group": group},
+        device="cpu",
+        pin_memory=False,
+    )
+    manager.initialize()
+
+    layout = manager.layouts["group"]
+    for spec in layout.specs:
+        assert spec.cpu_offset % 16 == 0
+        assert spec.gpu_offset % 16 == 0
+
+    manager.stage("group")
+    assert group.prefix.data_ptr() % 16 == 0
+    assert group.alignment_sensitive.data_ptr() % 16 == 0
 
 
 def test_offload_pipeline_context_stages_requested_group():
