@@ -109,10 +109,23 @@ python visual_gen_wan_t2v.py \
     --output_path output_offloaded.avi
 ```
 
+For Wan 2.2 T2V models, use the same flag:
+```bash
+python visual_gen_wan_t2v.py \
+    --model_path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+    --prompt "A cute cat playing piano" \
+    --height 480 --width 832 --num_frames 33 \
+    --enable_offloading \
+    --enable_cuda_memory_logging \
+    --output_path output_wan22_offloaded.avi
+```
+
 For Wan text-to-video, CPU offloading stages the text encoder and transformer
-blocks between CPU and GPU to reduce peak GPU memory usage. CUDA peak memory
-logging is disabled by default; add `--enable_cuda_memory_logging` to log each
-rank's peak allocator memory for development comparisons.
+blocks between CPU and GPU to reduce peak GPU memory usage. Single-transformer
+models stage `transformer.blocks`; Wan 2.2 A14B stages `transformer.blocks` and
+`transformer_2.blocks` separately. CUDA peak memory logging is disabled by
+default; add `--enable_cuda_memory_logging` to log each rank's peak allocator
+memory for development comparisons.
 
 ### Multi-GPU Parallelism
 
