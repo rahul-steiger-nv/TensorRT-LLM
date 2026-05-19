@@ -268,16 +268,17 @@ class PipelineLoader:
         return pipeline
 
     def _get_load_time_cpu_offload_modules(
-        self, module: torch.nn.Module
+        self, pipeline: "BasePipeline"
     ) -> list[torch.nn.Module]:
+        available_parts = pipeline.collect_offload_pipeline_parts()
         modules: list[torch.nn.Module] = []
         seen: set[int] = set()
 
-        for child in module.modules():
-            get_modules = getattr(child, "load_time_cpu_offload_modules", None)
-            if not callable(get_modules):
-                continue
-            for offload_module in get_modules():
+        for stage in pipeline._filter_available_offload_stages(
+            pipeline.default_offload_stages(), available_parts
+        ):
+            for part in stage:
+                offload_module = available_parts[part].module
                 module_id = id(offload_module)
                 if module_id not in seen:
                     modules.append(offload_module)
