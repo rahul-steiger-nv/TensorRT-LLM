@@ -28,6 +28,9 @@ python models/wan_t2v.py
 
 # With a shared config for NVFP4 quantization
 python models/wan_t2v.py --extra_visual_gen_options configs/wan2.2-t2v-fp4-1gpu.yaml
+
+# With a shared config for CPU offloading, including VAE offload
+python models/wan_t2v.py --extra_visual_gen_options configs/wan-t2v-cpu-offload.yaml
 ```
 
 ## Prerequisites

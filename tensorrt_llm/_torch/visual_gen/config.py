@@ -354,6 +354,14 @@ class PipelineConfig(StrictBaseModel):
     enable_offloading: bool = False
     offload_device: Literal["cpu", "cuda"] = "cpu"
     offload_param_pin_memory: bool = True
+    offload_stages: Optional[List[Union[str, List[str]]]] = PydanticField(
+        default=None,
+        description=(
+            "Optional ordered offload stages. Each entry is either a part name "
+            "or a list of part names staged together, e.g. ['text_encoder', "
+            "'transformer.blocks', 'vae']."
+        ),
+    )
 
 
 # =============================================================================

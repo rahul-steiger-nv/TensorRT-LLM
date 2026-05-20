@@ -112,10 +112,15 @@ args = VisualGenArgs(
 
 TeaCache caches transformer outputs when timestep embeddings change slowly between denoising steps, skipping redundant computation. Enable with `teacache.enable_teacache: true` (YAML config). The `teacache_thresh` parameter controls the similarity threshold.
 
-### CPU Offloading
+### CPU Offloading (Wan T2V only)
 
-Wan text-to-video pipelines support CPU offloading to reduce peak GPU memory usage.
-Enable it with `--enable_offloading`:
+CPU offloading reduces peak GPU memory usage by staging selected pipeline
+components between CPU and GPU. It is currently supported on Wan text-to-video
+pipelines (`WanPipeline`); the Wan image-to-video pipeline does not yet wrap
+its VAE and text encoder call sites with the offload context, so offloading is
+not supported there. CUDA graphs are not supported together with offloading.
+
+Enable the default Wan T2V offload stages with `--enable_offloading`:
 
 ```bash
 python visual_gen_wan_t2v.py \
@@ -126,10 +131,30 @@ python visual_gen_wan_t2v.py \
     --output_path output_offloaded.avi
 ```
 
-For single-transformer Wan models, including Wan 2.1 T2V and Wan 2.2 TI2V-5B,
-CPU offloading stages the text encoder and `transformer.blocks` between CPU and
-GPU. For Wan 2.2 A14B models, it also stages `transformer_2.blocks`. CUDA graphs
-are not currently supported with visual generation offloading.
+For single-transformer Wan T2V models (Wan 2.1 T2V and Wan 2.2 TI2V-5B), the
+default stages the text encoder and `transformer.blocks` between CPU and GPU.
+For Wan 2.2 A14B T2V it also stages `transformer_2.blocks`.
+
+To choose specific pipeline components, pass a YAML config to a Wan T2V
+pipeline through `--extra_visual_gen_options`:
+
+```yaml
+pipeline:
+  enable_offloading: true
+  offload_device: cpu
+  offload_stages:
+    - text_encoder
+    - transformer.blocks
+    - transformer_2.blocks  # Wan 2.2 A14B only; ignored otherwise.
+    - vae
+cuda_graph:
+  enable_cuda_graph: false
+```
+
+Unavailable parts are ignored, so `transformer_2.blocks` is used by Wan 2.2
+A14B and skipped for single-transformer Wan T2V models. Listing `vae` or
+`text_encoder` on non-T2V pipelines is not supported and may produce incorrect
+results.
 
 ### Multi-GPU Parallelism
 

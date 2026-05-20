@@ -21,11 +21,12 @@ import pytest
 import torch
 import torch.nn as nn
 
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+from tensorrt_llm._torch.visual_gen.config import PipelineConfig, VisualGenArgs
 from tensorrt_llm._torch.visual_gen.offloading import (
     ModuleOffloadManager,
     OffloadPipeline,
 )
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 
 
 class _ToyModule(nn.Module):
@@ -44,6 +45,17 @@ class _AlignmentToyModule(nn.Module):
         self.alignment_sensitive = nn.Parameter(torch.ones((3,), dtype=torch.bfloat16))
 
 
+class _ToyTransformer(nn.Module):
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.blocks = _ToyModule(weight_value=3.0, bias_value=30.0)
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+
 class _OffloadCudaGraphPipeline(BasePipeline):
 
     def _init_transformer(self) -> None:
@@ -51,6 +63,30 @@ class _OffloadCudaGraphPipeline(BasePipeline):
 
     def default_offload_stages(self) -> tuple[tuple[str, ...], ...]:
         return (("transformer",),)
+
+
+class _CustomOffloadPipeline(BasePipeline):
+
+    def _init_transformer(self) -> None:
+        self.transformer = _ToyTransformer()
+        self.text_encoder = _ToyModule(weight_value=1.0, bias_value=10.0)
+        self.vae = _ToyModule(weight_value=2.0, bias_value=20.0)
+
+
+def _make_config(
+    *,
+    enable_offloading: bool = True,
+    offload_stages: list[str | list[str]] | None = None,
+):
+    return SimpleNamespace(
+        pretrained_config=SimpleNamespace(),
+        cuda_graph=SimpleNamespace(enable_cuda_graph=False),
+        torch_compile=SimpleNamespace(enable_torch_compile=False),
+        pipeline=PipelineConfig(
+            enable_offloading=enable_offloading,
+            offload_stages=offload_stages,
+        ),
+    )
 
 
 def _make_manager() -> tuple[ModuleOffloadManager, _ToyModule, _ToyModule]:
@@ -73,11 +109,8 @@ def _storage_ptr(tensor: torch.Tensor) -> int:
 
 
 def test_cuda_graphs_with_offload_raise_not_implemented():
-    config = SimpleNamespace(
-        pretrained_config=SimpleNamespace(),
-        cuda_graph=SimpleNamespace(enable_cuda_graph=True),
-        torch_compile=SimpleNamespace(enable_torch_compile=False),
-    )
+    config = _make_config()
+    config.cuda_graph.enable_cuda_graph = True
 
     with pytest.raises(
         NotImplementedError,
@@ -87,12 +120,7 @@ def test_cuda_graphs_with_offload_raise_not_implemented():
 
 
 def test_offload_context_requires_initialized_pipeline_when_configured():
-    config = SimpleNamespace(
-        pretrained_config=SimpleNamespace(),
-        cuda_graph=SimpleNamespace(enable_cuda_graph=False),
-        torch_compile=SimpleNamespace(enable_torch_compile=False),
-    )
-    pipeline = _OffloadCudaGraphPipeline(config)
+    pipeline = _OffloadCudaGraphPipeline(_make_config())
 
     with pipeline.offload_context("transformer", enable=False):
         pass
@@ -103,6 +131,82 @@ def test_offload_context_requires_initialized_pipeline_when_configured():
     ):
         with pipeline.offload_context("transformer"):
             pass
+
+
+def test_configured_offload_stages_override_model_defaults_and_expose_vae():
+    pipeline = _CustomOffloadPipeline(
+        _make_config(
+            offload_stages=[
+                "text_encoder",
+                ["transformer.blocks", "vae"],
+                "transformer_2.blocks",
+            ]
+        )
+    )
+
+    assert pipeline.offload_stages() == (
+        ("text_encoder",),
+        ("transformer.blocks", "vae"),
+        ("transformer_2.blocks",),
+    )
+
+    parts = pipeline.collect_offload_pipeline_parts()
+    assert parts["text_encoder"] is pipeline.text_encoder
+    assert parts["transformer.blocks"] is pipeline.transformer.blocks
+    assert parts["vae"] is pipeline.vae
+
+    assert pipeline._filter_available_offload_stages(pipeline.offload_stages(), parts) == (
+        ("text_encoder",),
+        ("transformer.blocks", "vae"),
+    )
+
+
+def test_offload_context_resolves_part_to_grouped_stage():
+    pipeline = _CustomOffloadPipeline(
+        _make_config(offload_stages=[["transformer.blocks", "vae"]])
+    )
+    pipeline.initialize_offload_pipeline()
+
+    with pipeline.offload_context("vae"):
+        assert pipeline._offload_pipeline is not None
+        assert pipeline._offload_pipeline.manager.active_group_name == "transformer.blocks+vae"
+
+    pipeline.cleanup()
+
+
+def test_offload_context_uses_filtered_group_when_stage_parts_are_unavailable():
+    pipeline = _CustomOffloadPipeline(
+        _make_config(offload_stages=[["transformer.blocks", "transformer_2.blocks"]])
+    )
+    pipeline.initialize_offload_pipeline()
+
+    with pipeline.offload_context("transformer.blocks"):
+        assert pipeline._offload_pipeline is not None
+        assert pipeline._offload_pipeline.manager.active_group_name == "transformer.blocks"
+
+    pipeline.cleanup()
+
+
+def test_visual_gen_args_loads_yaml_offload_stages(tmp_path):
+    config_path = tmp_path / "visual_gen.yaml"
+    config_path.write_text(
+        """
+pipeline:
+  enable_offloading: true
+  offload_stages:
+    - text_encoder
+    - [transformer.blocks, vae]
+""",
+        encoding="utf-8",
+    )
+
+    args = VisualGenArgs.from_yaml(config_path)
+
+    assert args.pipeline.enable_offloading is True
+    assert args.pipeline.offload_stages == [
+        "text_encoder",
+        ["transformer.blocks", "vae"],
+    ]
 
 
 def test_initialize_reports_cpu_storage_allocation_context():

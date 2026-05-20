@@ -65,6 +65,7 @@ class BasePipeline(nn.Module):
         self.mapping: Mapping = getattr(model_config, "mapping", None) or Mapping()
         self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
         self._offload_pipeline: Optional[OffloadPipeline] = None
+        self._offload_group_name_by_part: dict[str, str] = {}
         self._parallel_vae_enabled: bool = False
         self._warmed_up_shapes: Set[tuple] = set()
 
@@ -140,9 +141,9 @@ class BasePipeline(nn.Module):
         return self.transformer.device
 
     @property
-    def transformer_components(self) -> list:
-        """Return list of transformer components this pipeline needs."""
-        return [PipelineComponent.TRANSFORMER] if self.transformer is not None else []
+    def transformer_components(self) -> list[str]:
+        """Return names of transformer components this pipeline needs."""
+        return [PipelineComponent.TRANSFORMER.value] if self.transformer is not None else []
 
     def warmup_cache_key(self, height: int, width: int, num_frames: int) -> tuple:
         """Return the cache key for a given warmup shape.
@@ -327,27 +328,63 @@ class BasePipeline(nn.Module):
         """
         return ()
 
+    @staticmethod
+    def _normalize_offload_stages(stages: list[str | list[str]]) -> tuple[OffloadPipelineStage, ...]:
+        """Normalize user-configured offload stages to tuple form."""
+        normalized_stages: list[OffloadPipelineStage] = []
+        for stage in stages:
+            parts = (stage,) if isinstance(stage, str) else tuple(stage)
+            if not parts:
+                raise ValueError("Offload stages must contain at least one part")
+            normalized_stages.append(parts)
+        return tuple(normalized_stages)
+
     def offload_stages(self) -> tuple[OffloadPipelineStage, ...]:
         """Return offload stages resolved from the pipeline configuration."""
+        pipeline_config = getattr(self.model_config, "pipeline", None)
+        if pipeline_config is None or not pipeline_config.enable_offloading:
+            return ()
+        configured_stages = getattr(pipeline_config, "offload_stages", None)
+        if configured_stages is not None:
+            return self._normalize_offload_stages(configured_stages)
         return self.default_offload_stages()
 
     def requested_offload_parts(self) -> set[str]:
         """Return all part names referenced by the configured stages."""
         return {part for stage in self.offload_stages() for part in stage}
 
+    def _offload_group_name_for_part(self, part_name: str) -> str:
+        """Return the stage group name that contains ``part_name``."""
+        if self._offload_group_name_by_part:
+            return self._offload_group_name_by_part.get(part_name, part_name)
+        for stage in self.offload_stages():
+            if part_name in stage:
+                return "+".join(stage)
+        return part_name
+
+    @staticmethod
+    def _offload_group_names_by_part(
+        stages: tuple[OffloadPipelineStage, ...],
+    ) -> dict[str, str]:
+        """Map each part to its initialized offload group name."""
+        return {part: "+".join(stage) for stage in stages for part in stage}
+
     def offload_pipeline_part_owners(self) -> tuple[Any, ...]:
         """Return objects that may advertise offloadable parts."""
         return tuple(self.modules())
 
     def offload_pipeline_parts(self) -> dict[str, nn.Module]:
-        """Expose standard text encoder and transformer block subtrees for offloading."""
+        """Expose standard component subtrees for offloading."""
         parts: dict[str, nn.Module] = {}
         text_encoder = getattr(self, PipelineComponent.TEXT_ENCODER.value, None)
         if text_encoder is not None:
             parts[PipelineComponent.TEXT_ENCODER.value] = text_encoder
 
-        for name in self.transformer_components:
-            component_name = getattr(name, "value", name)
+        vae = getattr(self, PipelineComponent.VAE.value, None)
+        if vae is not None:
+            parts[PipelineComponent.VAE.value] = vae
+
+        for component_name in self.transformer_components:
             transformer = getattr(self, component_name, None)
             blocks = getattr(transformer, "blocks", None) if transformer is not None else None
             if blocks is not None:
@@ -394,7 +431,7 @@ class BasePipeline(nn.Module):
             )
         if self._offload_pipeline is None:
             return nullcontext()
-        return self._offload_pipeline.context(group_name)
+        return self._offload_pipeline.context(self._offload_group_name_for_part(group_name))
 
     def initialize_offload_pipeline(self) -> None:
         """Create and initialize the offload pipeline after weights are loaded."""
@@ -418,13 +455,15 @@ class BasePipeline(nn.Module):
         pin_memory = bool(getattr(pipeline_config, "offload_param_pin_memory", True))
         stage_summary = " -> ".join("+".join(stage) for stage in stages)
         logger.info(f"{self.__class__.__name__} offload pipeline enabled: {stage_summary}")
-        self._offload_pipeline = OffloadPipeline(
+        offload_pipeline = OffloadPipeline(
             stages=stages,
             parts=available_parts,
             device=self.offload_pipeline_device(requested_parts),
             pin_memory=pin_memory,
         )
-        self._offload_pipeline.initialize()
+        offload_pipeline.initialize()
+        self._offload_pipeline = offload_pipeline
+        self._offload_group_name_by_part = self._offload_group_names_by_part(stages)
 
     def _apply_teacache_coefficients(self, coefficients: Optional[Dict]) -> None:
         """Pick TeaCache coefficients from checkpoint path; updates model_config.teacache in place."""
@@ -1099,6 +1138,7 @@ class BasePipeline(nn.Module):
         if self._offload_pipeline is not None:
             self._offload_pipeline.cleanup()
             self._offload_pipeline = None
+            self._offload_group_name_by_part = {}
         for name, runner in self._cuda_graph_runners.items():
             logger.info(f"Releasing CUDA graphs for {name}")
             runner.clear()

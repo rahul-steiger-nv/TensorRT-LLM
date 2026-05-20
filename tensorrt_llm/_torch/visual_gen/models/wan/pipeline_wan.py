@@ -141,7 +141,7 @@ class WanPipeline(BasePipeline):
         return self.transformer.device
 
     @property
-    def transformer_components(self) -> list:
+    def transformer_components(self) -> list[str]:
         """Return list of transformer components this pipeline needs."""
         if self.transformer_2 is not None:
             return ["transformer", "transformer_2"]
@@ -186,11 +186,21 @@ class WanPipeline(BasePipeline):
             self.transformer_2 = WanTransformer3DModel(model_config=self.model_config)
 
     def default_offload_stages(self) -> tuple[tuple[str, ...], ...]:
-        """Return WAN offload stages for the loaded transformer topology."""
-        pipeline_config = getattr(self.model_config, "pipeline", None)
-        if pipeline_config is None or not pipeline_config.enable_offloading:
-            return ()
+        """Return WAN offload stages for the loaded transformer topology.
+
+        Only invoked when ``pipeline.enable_offloading`` is true (the base
+        class short-circuits before calling this). Defaults are CPU-staged
+        today; non-CPU offload devices skip the defaults and require
+        explicit ``pipeline.offload_stages`` from the user.
+        """
+        pipeline_config = self.model_config.pipeline
         if pipeline_config.offload_device != "cpu":
+            logger.warning(
+                "Wan default offload stages are CPU-only; "
+                f"offload_device='{pipeline_config.offload_device}' has no "
+                "default stages. Set pipeline.offload_stages explicitly to "
+                "stage components on a non-CPU device."
+            )
             return ()
 
         if self.transformer_2 is not None:
@@ -245,11 +255,16 @@ class WanPipeline(BasePipeline):
 
         if PipelineComponent.VAE not in skip_components:
             logger.info("Loading VAE...")
+            vae_device = (
+                torch.device("cpu")
+                if PipelineComponent.VAE.value in self.requested_offload_parts()
+                else device
+            )
             self.vae = AutoencoderKLWan.from_pretrained(
                 checkpoint_dir,
                 subfolder=PipelineComponent.VAE,
                 torch_dtype=torch.bfloat16,  # load VAE in BF16 for memory saving
-            ).to(device)
+            ).to(vae_device)
 
             self.vae_scale_factor_temporal = getattr(self.vae.config, "scale_factor_temporal", 4)
             self.vae_scale_factor_spatial = getattr(
@@ -555,7 +570,10 @@ class WanPipeline(BasePipeline):
                     # T2V: current_t for all frames
                     timestep = current_t.reshape(1, 1).expand(latents.shape[0], nf * nh * nw)
 
-            with self.offload_context(offload_stage):
+            with self.offload_context(
+                offload_stage,
+                enable=offload_stage in self.requested_offload_parts(),
+            ):
                 return current_model(
                     hidden_states=latents,
                     timestep=timestep,
@@ -613,7 +631,10 @@ class WanPipeline(BasePipeline):
             input_ids = text_inputs.input_ids.to(self.device)
             attention_mask = text_inputs.attention_mask.to(self.device)
 
-            with self.offload_context("text_encoder"):
+            with self.offload_context(
+                PipelineComponent.TEXT_ENCODER.value,
+                enable=PipelineComponent.TEXT_ENCODER.value in self.requested_offload_parts(),
+            ):
                 embeds = self.text_encoder(input_ids, attention_mask=attention_mask).last_hidden_state
             embeds = embeds.to(self.dtype)
 
@@ -705,9 +726,13 @@ class WanPipeline(BasePipeline):
         )
 
         # Encode video condition through VAE
-        latent_condition = retrieve_latents(self.vae.encode(image), sample_mode="argmax").to(
-            self.dtype
-        )
+        with self.offload_context(
+            PipelineComponent.VAE.value,
+            enable=PipelineComponent.VAE.value in self.requested_offload_parts(),
+        ):
+            latent_condition = retrieve_latents(self.vae.encode(image), sample_mode="argmax").to(
+                self.dtype
+            )
         if batch_size > 1:
             latent_condition = latent_condition.repeat(batch_size, 1, 1, 1, 1)
 
@@ -763,7 +788,11 @@ class WanPipeline(BasePipeline):
             latents = latents / scaling_factor
 
         # VAE decode: returns (B, C, T, H, W)
-        video = self.vae.decode(latents, return_dict=False)[0]
+        with self.offload_context(
+            PipelineComponent.VAE.value,
+            enable=PipelineComponent.VAE.value in self.requested_offload_parts(),
+        ):
+            video = self.vae.decode(latents, return_dict=False)[0]
 
         # Post-process video tensor: (B, C, T, H, W) -> (B, T, H, W, C)
         video = postprocess_video_tensor(video)
