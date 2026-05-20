@@ -105,7 +105,6 @@ python visual_gen_wan_t2v.py \
     --prompt "A cute cat playing piano" \
     --height 480 --width 832 --num_frames 33 \
     --enable_offloading \
-    --enable_cuda_memory_logging \
     --output_path output_offloaded.avi
 ```
 
@@ -116,7 +115,6 @@ python visual_gen_wan_t2v.py \
     --prompt "A cute cat playing piano" \
     --height 480 --width 832 --num_frames 33 \
     --enable_offloading \
-    --enable_cuda_memory_logging \
     --output_path output_wan22_offloaded.avi
 ```
 

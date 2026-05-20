@@ -16,6 +16,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 - Quantization support (dynamic and static) using the [ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer) configuration format.
 - Multi-GPU parallelism (CFG parallel, Ulysses sequence parallel).
 - **TeaCache** — a runtime caching optimization that skips transformer steps when timestep embeddings change slowly.
+- CPU offloading for Wan text-to-video pipelines to reduce peak GPU memory usage.
 - `trtllm-serve` integration with OpenAI-compatible API endpoints for image and video generation.
 
 ## Supported Models
@@ -110,6 +111,25 @@ args = VisualGenArgs(
 ### TeaCache
 
 TeaCache caches transformer outputs when timestep embeddings change slowly between denoising steps, skipping redundant computation. Enable with `teacache.enable_teacache: true` (YAML config). The `teacache_thresh` parameter controls the similarity threshold.
+
+### CPU Offloading
+
+Wan text-to-video pipelines support CPU offloading to reduce peak GPU memory usage.
+Enable it with `--enable_offloading`:
+
+```bash
+python visual_gen_wan_t2v.py \
+    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+    --prompt "A cute cat playing piano" \
+    --height 480 --width 832 --num_frames 33 \
+    --enable_offloading \
+    --output_path output_offloaded.avi
+```
+
+For single-transformer Wan models, including Wan 2.1 T2V and Wan 2.2 TI2V-5B,
+CPU offloading stages the text encoder and `transformer.blocks` between CPU and
+GPU. For Wan 2.2 A14B models, it also stages `transformer_2.blocks`. CUDA graphs
+are not currently supported with visual generation offloading.
 
 ### Multi-GPU Parallelism
 

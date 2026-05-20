@@ -19,7 +19,6 @@ from tensorrt_llm._torch.visual_gen.models.wan.defaults import (
     get_wan_extra_param_specs,
 )
 from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_utils import retrieve_latents
-from tensorrt_llm._torch.visual_gen.offloading import OffloadPipelinePart
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
@@ -194,20 +193,9 @@ class WanPipeline(BasePipeline):
         if pipeline_config.offload_device != "cpu":
             return ()
 
-        if self.is_wan22_14b:
+        if self.transformer_2 is not None:
             return _WAN_TWO_TRANSFORMER_OFFLOAD_STAGES
         return _WAN_SINGLE_TRANSFORMER_OFFLOAD_STAGES
-
-    def offload_pipeline_parts(self) -> dict[str, OffloadPipelinePart]:
-        """Expose text encoder and transformer block subtrees for offloading."""
-        parts: dict[str, OffloadPipelinePart] = {}
-        if getattr(self, "text_encoder", None) is not None:
-            parts["text_encoder"] = OffloadPipelinePart(self.text_encoder)
-        for name in self.transformer_components:
-            transformer = getattr(self, name, None)
-            if transformer is not None:
-                parts[f"{name}.blocks"] = OffloadPipelinePart(module=transformer.blocks)
-        return parts
 
     def load_standard_components(
         self,

@@ -25,7 +25,6 @@ from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.offloading import (
     ModuleOffloadManager,
     OffloadPipeline,
-    OffloadPipelinePart,
 )
 
 
@@ -206,8 +205,8 @@ def test_offload_pipeline_context_stages_requested_group():
     pipeline = OffloadPipeline(
         stages=(("group_a",), ("group_b",)),
         parts={
-            "group_a": OffloadPipelinePart(group_a),
-            "group_b": OffloadPipelinePart(group_b),
+            "group_a": group_a,
+            "group_b": group_b,
         },
         device="cpu",
         pin_memory=False,

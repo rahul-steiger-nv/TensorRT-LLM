@@ -19,7 +19,7 @@ from .checkpoints import WeightLoader
 from .config import PipelineComponent
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
-from .offloading import OffloadPipeline, OffloadPipelinePart, OffloadPipelineStage
+from .offloading import OffloadPipeline, OffloadPipelineStage
 
 
 class ExtraParamSchema(StrictBaseModel):
@@ -339,9 +339,24 @@ class BasePipeline(nn.Module):
         """Return objects that may advertise offloadable parts."""
         return tuple(self.modules())
 
-    def collect_offload_pipeline_parts(self) -> dict[str, OffloadPipelinePart]:
+    def offload_pipeline_parts(self) -> dict[str, nn.Module]:
+        """Expose standard text encoder and transformer block subtrees for offloading."""
+        parts: dict[str, nn.Module] = {}
+        text_encoder = getattr(self, PipelineComponent.TEXT_ENCODER.value, None)
+        if text_encoder is not None:
+            parts[PipelineComponent.TEXT_ENCODER.value] = text_encoder
+
+        for name in self.transformer_components:
+            component_name = getattr(name, "value", name)
+            transformer = getattr(self, component_name, None)
+            blocks = getattr(transformer, "blocks", None) if transformer is not None else None
+            if blocks is not None:
+                parts[f"{component_name}.blocks"] = blocks
+        return parts
+
+    def collect_offload_pipeline_parts(self) -> dict[str, nn.Module]:
         """Collect all named offloadable module subtrees from the pipeline."""
-        parts: dict[str, OffloadPipelinePart] = {}
+        parts: dict[str, nn.Module] = {}
         for owner in self.offload_pipeline_part_owners():
             if owner is None:
                 continue
@@ -353,7 +368,7 @@ class BasePipeline(nn.Module):
     def _filter_available_offload_stages(
         self,
         stages: tuple[OffloadPipelineStage, ...],
-        available_parts: dict[str, OffloadPipelinePart],
+        available_parts: dict[str, nn.Module],
     ) -> tuple[OffloadPipelineStage, ...]:
         """Drop stage parts that are unavailable for the loaded components."""
         return tuple(

@@ -285,7 +285,7 @@ class PipelineLoader:
             pipeline.offload_stages(), available_parts
         ):
             for part in stage:
-                offload_module = available_parts[part].module
+                offload_module = available_parts[part]
                 module_id = id(offload_module)
                 if module_id not in seen:
                     modules.append(offload_module)

@@ -44,18 +44,6 @@ def _format_bytes(num_bytes: int) -> str:
 _PACKED_TENSOR_ALIGNMENT = 16
 
 
-@dataclass(frozen=True)
-class OffloadPipelinePart:
-    """One model-defined offloadable module subtree.
-
-    Pipeline implementations expose these parts by name, then choose stages that
-    group one or more parts together. A stage becomes the unit that is copied
-    from CPU storage into the GPU arena.
-    """
-
-    module: nn.Module
-
-
 OffloadPipelineStage = tuple[str, ...]
 
 
@@ -430,7 +418,9 @@ class ModuleOffloadManager:
         if self.cpu_storage is None or self.gpu_arena is None:
             raise RuntimeError("ModuleOffloadManager must be initialized before staging")
 
-        self._deactivate_active_group()
+        if self.active_group_name is not None:
+            self._rebind_to_cpu(self.active_group_name)
+            self.active_group_name = None
 
         src = self.cpu_storage.narrow(0, layout.cpu_offset, layout.nbytes)
         dst = self.gpu_arena.narrow(0, 0, layout.nbytes)
@@ -458,13 +448,6 @@ class ModuleOffloadManager:
             raise RuntimeError("ModuleOffloadManager must be initialized before staging")
         self._bind_views(layout, layout.gpu_views)
 
-    def _deactivate_active_group(self) -> None:
-        if self.active_group_name is None:
-            return
-
-        self._rebind_to_cpu(self.active_group_name)
-        self.active_group_name = None
-
 
 class OffloadPipeline:
     """Stage offload groups explicitly from model call-site contexts.
@@ -477,7 +460,7 @@ class OffloadPipeline:
     def __init__(
         self,
         stages: Sequence[Sequence[str] | str],
-        parts: Mapping[str, OffloadPipelinePart],
+        parts: Mapping[str, nn.Module],
         device: torch.device | str,
         pin_memory: bool = True,
     ) -> None:
@@ -512,7 +495,7 @@ class OffloadPipeline:
                         f"Unknown offload pipeline part '{part_name}' for stage "
                         f"'{group_name}'. Available parts: {sorted(self.parts)}"
                     ) from e
-                modules.append(part.module)
+                modules.append(part)
 
             group_module = modules[0] if len(modules) == 1 else nn.ModuleList(modules)
             groups[group_name] = group_module
@@ -530,8 +513,13 @@ class OffloadPipeline:
     def context(self, group_name: str):
         """Stage ``group_name`` and return a no-op context manager."""
         self.manager.stage(group_name)
+        # The active group intentionally stays resident after the call site.
+        # The next stage() call rebinds it back to CPU before staging another
+        # group, and cleanup() handles the final rebind when the pipeline exits.
         return nullcontext()
 
     def cleanup(self) -> None:
         """Return the active group to CPU-backed views."""
-        self.manager._deactivate_active_group()
+        if self.manager.active_group_name is not None:
+            self.manager._rebind_to_cpu(self.manager.active_group_name)
+            self.manager.active_group_name = None
