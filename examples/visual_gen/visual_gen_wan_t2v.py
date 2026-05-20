@@ -7,6 +7,8 @@
 import argparse
 import time
 
+import yaml
+
 from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams, logger
 from tensorrt_llm._torch.visual_gen.config import CacheDiTConfig, TeaCacheConfig
 from tensorrt_llm.serve.media_storage import MediaStorage
@@ -31,6 +33,12 @@ def parse_args():
         type=str,
         default=None,
         help="HuggingFace Hub revision (branch, tag, or commit SHA)",
+    )
+    parser.add_argument(
+        "--extra_visual_gen_options",
+        type=str,
+        default=None,
+        help="Path to a YAML file with extra VisualGen pipeline options.",
     )
     parser.add_argument("--prompt", type=str, required=True, help="Text prompt for generation")
     parser.add_argument(
@@ -311,6 +319,19 @@ def _cache_dit_config_from_args(args) -> CacheDiTConfig:
     return CacheDiTConfig(**overrides)
 
 
+def _load_extra_pipeline_options(config_path: str | None) -> dict:
+    if config_path is None:
+        return {}
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
+    if not isinstance(config, dict):
+        raise ValueError(f"Expected a YAML mapping in {config_path}")
+    pipeline_options = config.get("pipeline", {})
+    if not isinstance(pipeline_options, dict):
+        raise ValueError(f"Expected 'pipeline' to be a mapping in {config_path}")
+    return pipeline_options
+
+
 def main():
     args = parse_args()
 
@@ -337,6 +358,15 @@ def main():
     else:
         cache_kwargs = {}
 
+    pipeline_kwargs = _load_extra_pipeline_options(args.extra_visual_gen_options)
+    pipeline_kwargs.setdefault("offload_device", "cpu")
+    if args.enable_layerwise_nvtx_marker:
+        pipeline_kwargs["enable_layerwise_nvtx_marker"] = True
+    if args.enable_cuda_memory_logging:
+        pipeline_kwargs["enable_cuda_memory_logging"] = True
+    if args.enable_offloading:
+        pipeline_kwargs["enable_offloading"] = True
+
     kwargs = dict(
         revision=args.revision,
         attention={"backend": args.attention_backend},
@@ -354,17 +384,11 @@ def main():
             "enable_autotune": not args.disable_autotune,
         },
         cuda_graph={"enable_cuda_graph": args.enable_cudagraph},
-        pipeline={
-            "enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker,
-            "enable_cuda_memory_logging": args.enable_cuda_memory_logging,
-            "enable_offloading": args.enable_offloading,
-            "offload_device": "cpu",
-        },
+        pipeline=pipeline_kwargs,
     )
     quant_config = _linear_type_to_quant_config(args.linear_type)
     if quant_config is not None:
         kwargs["quant_config"] = quant_config
-
     diffusion_args = VisualGenArgs(**kwargs)
 
     logger.info(

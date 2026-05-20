@@ -135,6 +135,18 @@ For single-transformer Wan T2V models (Wan 2.1 T2V and Wan 2.2 TI2V-5B), the
 default stages the text encoder and `transformer.blocks` between CPU and GPU.
 For Wan 2.2 A14B T2V it also stages `transformer_2.blocks`.
 
+Pass an extra VisualGen YAML config to include the VAE in the offloaded stages:
+
+```bash
+python visual_gen_wan_t2v.py \
+    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+    --prompt "A cute cat playing piano" \
+    --height 480 --width 832 --num_frames 33 \
+    --enable_offloading \
+    --extra_visual_gen_options configs/wan-t2v-cpu-offload.yaml \
+    --output_path output_offloaded.avi
+```
+
 To choose specific pipeline components, pass a YAML config to a Wan T2V
 pipeline through `--extra_visual_gen_options`:
 

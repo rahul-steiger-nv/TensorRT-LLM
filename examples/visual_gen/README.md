@@ -111,6 +111,17 @@ python visual_gen_wan_t2v.py \
     --output_path output_offloaded.avi
 ```
 
+Pass an extra VisualGen YAML config to include the VAE in the offloaded stages:
+```bash
+python visual_gen_wan_t2v.py \
+    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+    --prompt "A cute cat playing piano" \
+    --height 480 --width 832 --num_frames 33 \
+    --enable_offloading \
+    --extra_visual_gen_options configs/wan-t2v-cpu-offload.yaml \
+    --output_path output_offloaded.avi
+```
+
 For Wan 2.2 T2V models, use the same flag:
 ```bash
 python visual_gen_wan_t2v.py \
