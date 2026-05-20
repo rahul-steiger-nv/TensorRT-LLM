@@ -21,9 +21,11 @@ arena and the original module parameters/buffers are rebound to views of that
 storage.
 """
 
+import ctypes
+import gc
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Iterator, Mapping, Sequence
 
 import torch
 import torch.nn as nn
@@ -58,8 +60,7 @@ class _FlatTensorSpec:
     dtype: torch.dtype
     requires_grad: bool
     persistent: bool
-    cpu_offset: int
-    gpu_offset: int
+    offset: int
     nbytes: int
 
 
@@ -68,10 +69,9 @@ class _GroupLayout:
     """Packed storage layout and rebound views for one offload group."""
 
     name: str
-    module: nn.Module
-    cpu_offset: int
     nbytes: int
     specs: list[_FlatTensorSpec]
+    cpu_storage: torch.Tensor | None = None
     cpu_views: tuple[nn.Parameter | torch.Tensor, ...] = ()
     gpu_views: tuple[nn.Parameter | torch.Tensor, ...] = ()
 
@@ -79,13 +79,13 @@ class _GroupLayout:
 class ModuleOffloadManager:
     """Pack module groups into CPU storage and stage one group on GPU.
 
-    The manager owns two flat byte buffers:
-    - ``cpu_storage`` contains all offloaded groups.
+    The manager owns packed byte buffers:
+    - each layout owns ``cpu_storage`` for one offloaded group.
     - ``gpu_arena`` is reused for whichever group is currently active.
 
-    Initializing the manager temporarily keeps both the original CPU tensors and
-    packed CPU storage alive. This preserves compatibility with quantization
-    flows that may replace or repack parameters during loading.
+    Initializing the manager uses the GPU arena as temporary staging so each
+    group can release original CPU tensors before allocating its packed CPU
+    storage.
     """
 
     def __init__(
@@ -100,7 +100,6 @@ class ModuleOffloadManager:
         self.groups = dict(groups)
         self.device = torch.device(device)
         self.pin_memory = pin_memory
-        self.cpu_storage: torch.Tensor | None = None
         self.gpu_arena: torch.Tensor | None = None
         self.layouts: dict[str, _GroupLayout] = {}
         self.active_group_name: str | None = None
@@ -156,9 +155,7 @@ class ModuleOffloadManager:
         qualified_name: str,
         tensor: torch.Tensor,
         is_parameter: bool,
-        cpu_offset: int,
-        gpu_offset: int,
-        absolute_cpu_offset: int | None = None,
+        offset: int,
     ) -> _FlatTensorSpec:
         display_name = f"{group_name}.{qualified_name}"
         if not tensor.is_contiguous():
@@ -178,30 +175,23 @@ class ModuleOffloadManager:
             dtype=tensor.dtype,
             requires_grad=tensor.requires_grad if is_parameter else False,
             persistent=True if is_parameter else name not in owner._non_persistent_buffers_set,
-            cpu_offset=absolute_cpu_offset if absolute_cpu_offset is not None else cpu_offset + gpu_offset,
-            gpu_offset=gpu_offset,
+            offset=offset,
             nbytes=self._tensor_nbytes(tensor),
         )
 
-    def _group_tensors(
+    def _iter_group_tensors(
         self, group_module: nn.Module
-    ) -> list[tuple[str, torch.Tensor, bool]]:
-        tensors: list[tuple[str, torch.Tensor, bool]] = []
-        tensors.extend(
-            (qualified_name, param.detach(), True)
-            for qualified_name, param in group_module.named_parameters(
-                recurse=True,
-                remove_duplicate=False,
-            )
-        )
-        tensors.extend(
-            (qualified_name, buffer.detach(), False)
-            for qualified_name, buffer in group_module.named_buffers(
-                recurse=True,
-                remove_duplicate=False,
-            )
-        )
-        return tensors
+    ) -> Iterator[tuple[str, torch.Tensor, bool]]:
+        for qualified_name, param in group_module.named_parameters(
+            recurse=True,
+            remove_duplicate=False,
+        ):
+            yield qualified_name, param.detach(), True
+        for qualified_name, buffer in group_module.named_buffers(
+            recurse=True,
+            remove_duplicate=False,
+        ):
+            yield qualified_name, buffer.detach(), False
 
     def _append_layout_spec(
         self,
@@ -210,22 +200,20 @@ class ModuleOffloadManager:
         qualified_name: str,
         tensor: torch.Tensor,
         is_parameter: bool,
-        cpu_offset: int,
-        gpu_offset: int,
+        offset: int,
         seen_tensors: dict[tuple[int, int], _FlatTensorSpec],
         specs: list[_FlatTensorSpec],
     ) -> int:
-        """Append a tensor spec and return the next GPU-local byte offset.
+        """Append a tensor spec and return the next group-local byte offset.
 
         This handles three layout concerns in one place: alias reuse, packed
-        tensor alignment, and spec construction. CPU offsets are absolute within
-        the full packed storage, while GPU offsets are relative to the reusable
-        arena.
+        tensor alignment, and spec construction. The offset is local to this
+        group and is shared by the CPU storage and reusable GPU arena views.
         """
         display_name = f"{group_name}.{qualified_name}"
         alias = self._get_alias_spec(seen_tensors, tensor, display_name)
         if alias is None:
-            gpu_offset = _align_offset(gpu_offset, _PACKED_TENSOR_ALIGNMENT)
+            offset = _align_offset(offset, _PACKED_TENSOR_ALIGNMENT)
 
         spec = self._build_spec(
             group_name=group_name,
@@ -233,37 +221,32 @@ class ModuleOffloadManager:
             qualified_name=qualified_name,
             tensor=tensor,
             is_parameter=is_parameter,
-            cpu_offset=cpu_offset,
-            gpu_offset=alias.gpu_offset if alias is not None else gpu_offset,
-            absolute_cpu_offset=alias.cpu_offset if alias is not None else None,
+            offset=alias.offset if alias is not None else offset,
         )
         specs.append(spec)
 
         if alias is not None:
-            return gpu_offset
+            return offset
 
         key = self._storage_key(tensor)
         if key is not None:
             seen_tensors[key] = spec
-        return gpu_offset + spec.nbytes
+        return offset + spec.nbytes
 
-    def _collect_group_layout(
-        self, group_name: str, group_module: nn.Module, cpu_offset: int
-    ) -> _GroupLayout:
+    def _collect_group_layout(self, group_name: str, group_module: nn.Module) -> _GroupLayout:
         """Build the packed storage layout for one named module group."""
-        gpu_offset = 0
+        offset = 0
         specs: list[_FlatTensorSpec] = []
         seen_tensors: dict[tuple[int, int], _FlatTensorSpec] = {}
 
-        for qualified_name, tensor, is_parameter in self._group_tensors(group_module):
-            gpu_offset = self._append_layout_spec(
+        for qualified_name, tensor, is_parameter in self._iter_group_tensors(group_module):
+            offset = self._append_layout_spec(
                 group_name=group_name,
                 group_module=group_module,
                 qualified_name=qualified_name,
                 tensor=tensor,
                 is_parameter=is_parameter,
-                cpu_offset=cpu_offset,
-                gpu_offset=gpu_offset,
+                offset=offset,
                 seen_tensors=seen_tensors,
                 specs=specs,
             )
@@ -273,27 +256,31 @@ class ModuleOffloadManager:
 
         return _GroupLayout(
             name=group_name,
-            module=group_module,
-            cpu_offset=cpu_offset,
-            nbytes=_align_offset(gpu_offset),
+            nbytes=_align_offset(offset),
             specs=specs,
         )
 
-    def _copy_group_to_cpu_storage(self, layout: _GroupLayout) -> None:
-        assert self.cpu_storage is not None
+    def _copy_group_to_gpu_arena(self, layout: _GroupLayout) -> None:
+        if self.gpu_arena is None:
+            raise RuntimeError("GPU arena must be allocated before staging offload groups")
         for spec in layout.specs:
             if spec.nbytes == 0:
                 continue
             try:
                 tensor = getattr(spec.owner, spec.name).detach()
-                tensor_bytes = tensor.reshape(-1).view(torch.uint8).cpu()
-                self.cpu_storage.narrow(0, spec.cpu_offset, spec.nbytes).copy_(tensor_bytes)
+                tensor_bytes = tensor.reshape(-1).view(torch.uint8)
+                self.gpu_arena.narrow(0, spec.offset, spec.nbytes).copy_(
+                    tensor_bytes,
+                    non_blocking=tensor_bytes.is_pinned() if tensor_bytes.device.type == "cpu" else False,
+                )
             except RuntimeError as e:
                 raise RuntimeError(
                     f"Failed to copy offload tensor '{spec.qualified_name}' "
                     f"({_format_bytes(spec.nbytes)}, shape={spec.shape}, dtype={spec.dtype}) "
-                    f"to packed CPU storage at offset {spec.cpu_offset}."
+                    f"to GPU arena at offset {spec.offset}."
                 ) from e
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
 
     def _group_size_summary(self) -> str:
         return ", ".join(
@@ -308,7 +295,18 @@ class ModuleOffloadManager:
             "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True before starting the process."
         )
 
-    def _allocate_cpu_storage(self, num_bytes: int) -> torch.Tensor:
+    @staticmethod
+    def _trim_host_allocator() -> None:
+        """Return freed host pages to the OS when the platform allocator supports it."""
+        gc.collect()
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+            malloc_trim = libc.malloc_trim
+        except (AttributeError, OSError):
+            return
+        malloc_trim(0)
+
+    def _allocate_cpu_storage(self, num_bytes: int, group_name: str | None = None) -> torch.Tensor:
         try:
             return torch.empty(
                 num_bytes,
@@ -317,9 +315,10 @@ class ModuleOffloadManager:
                 pin_memory=self.pin_memory,
             )
         except RuntimeError as e:
+            group_context = f", group='{group_name}'" if group_name is not None else ""
             raise RuntimeError(
                 "Failed to allocate packed CPU storage for visual generation offload "
-                f"({_format_bytes(num_bytes)}, {num_bytes} bytes, "
+                f"({_format_bytes(num_bytes)}, {num_bytes} bytes{group_context}, "
                 f"pin_memory={self.pin_memory}, groups=[{self._group_size_summary()}])."
             ) from e
 
@@ -334,21 +333,15 @@ class ModuleOffloadManager:
                 f"{self._cuda_allocation_hint()}"
             ) from e
 
-    def _typed_view(self, storage: torch.Tensor, offset: int, spec: _FlatTensorSpec) -> torch.Tensor:
-        byte_view = storage.narrow(0, offset, spec.nbytes)
-        typed_view = byte_view.view(spec.dtype)
-        return typed_view.as_strided(spec.shape, spec.stride)
-
     def _make_views(
         self,
         layout: _GroupLayout,
         storage: torch.Tensor,
-        use_gpu_offsets: bool,
     ) -> tuple[nn.Parameter | torch.Tensor, ...]:
         views: list[nn.Parameter | torch.Tensor] = []
         for spec in layout.specs:
-            offset = spec.gpu_offset if use_gpu_offsets else spec.cpu_offset
-            view = self._typed_view(storage, offset, spec)
+            view = storage.narrow(0, spec.offset, spec.nbytes).view(spec.dtype)
+            view = view.as_strided(spec.shape, spec.stride)
             if spec.is_parameter:
                 views.append(nn.Parameter(view, requires_grad=spec.requires_grad))
             else:
@@ -373,13 +366,11 @@ class ModuleOffloadManager:
         if self.layouts:
             raise RuntimeError("ModuleOffloadManager has already been initialized")
 
-        cpu_offset = 0
         for name, module in self.groups.items():
-            layout = self._collect_group_layout(name, module, cpu_offset)
+            layout = self._collect_group_layout(name, module)
             self.layouts[name] = layout
-            cpu_offset = _align_offset(layout.cpu_offset + layout.nbytes)
 
-        total_cpu_bytes = _align_offset(cpu_offset)
+        total_cpu_bytes = sum(layout.nbytes for layout in self.layouts.values())
         max_gpu_bytes = max(layout.nbytes for layout in self.layouts.values())
         logger.info(
             "Module offload storage layout: "
@@ -388,19 +379,35 @@ class ModuleOffloadManager:
             f"groups=[{self._group_size_summary()}], device={self.device}"
         )
 
-        self.cpu_storage = self._allocate_cpu_storage(total_cpu_bytes)
-
-        for layout in self.layouts.values():
-            self._copy_group_to_cpu_storage(layout)
-
         self.gpu_arena = self._allocate_gpu_arena(max_gpu_bytes)
 
-        for name, layout in self.layouts.items():
-            assert self.cpu_storage is not None
+        # Initialize one group at a time through the GPU arena. Rebinding the
+        # group to GPU views first releases its original CPU tensors before we
+        # allocate the packed CPU backing storage, avoiding a large host-memory
+        # peak during offload setup.
+        for layout in self.layouts.values():
             assert self.gpu_arena is not None
-            layout.cpu_views = self._make_views(layout, self.cpu_storage, use_gpu_offsets=False)
-            layout.gpu_views = self._make_views(layout, self.gpu_arena, use_gpu_offsets=True)
-            self._rebind_to_cpu(name)
+            logger.info(
+                "Module offload staging group through GPU arena: "
+                f"{layout.name} ({_format_bytes(layout.nbytes)})"
+            )
+            self._copy_group_to_gpu_arena(layout)
+            layout.gpu_views = self._make_views(layout, self.gpu_arena)
+            self._rebind_to_gpu(layout.name)
+            self._trim_host_allocator()
+
+            layout.cpu_storage = self._allocate_cpu_storage(layout.nbytes, group_name=layout.name)
+
+            layout.cpu_storage.copy_(
+                self.gpu_arena.narrow(0, 0, layout.nbytes),
+                non_blocking=layout.cpu_storage.is_pinned(),
+            )
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            layout.cpu_views = self._make_views(layout, layout.cpu_storage)
+            self._rebind_to_cpu(layout.name)
+            self.active_group_name = None
+            self._trim_host_allocator()
 
     def _get_layout(self, name: str) -> _GroupLayout:
         try:
@@ -415,17 +422,17 @@ class ModuleOffloadManager:
         layout = self._get_layout(name)
         if self.active_group_name == name:
             return
-        if self.cpu_storage is None or self.gpu_arena is None:
+        if layout.cpu_storage is None or self.gpu_arena is None:
             raise RuntimeError("ModuleOffloadManager must be initialized before staging")
 
         if self.active_group_name is not None:
             self._rebind_to_cpu(self.active_group_name)
             self.active_group_name = None
 
-        src = self.cpu_storage.narrow(0, layout.cpu_offset, layout.nbytes)
+        src = layout.cpu_storage.narrow(0, 0, layout.nbytes)
         dst = self.gpu_arena.narrow(0, 0, layout.nbytes)
         try:
-            dst.copy_(src, non_blocking=self.cpu_storage.is_pinned())
+            dst.copy_(src, non_blocking=layout.cpu_storage.is_pinned())
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
         except RuntimeError as e:

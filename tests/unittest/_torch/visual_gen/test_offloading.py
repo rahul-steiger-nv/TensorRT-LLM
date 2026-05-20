@@ -216,11 +216,15 @@ def test_initialize_reports_cpu_storage_allocation_context():
         device="cpu",
         pin_memory=False,
     )
+    gpu_arena = torch.empty(1024, dtype=torch.uint8, device="cpu")
 
     def fail_cpu_storage(*args, **kwargs):
         raise RuntimeError("cpu allocation failed")
 
-    with patch("torch.empty", side_effect=fail_cpu_storage):
+    with (
+        patch.object(manager, "_allocate_gpu_arena", return_value=gpu_arena),
+        patch("torch.empty", side_effect=fail_cpu_storage),
+    ):
         with pytest.raises(
             RuntimeError,
             match="Failed to allocate packed CPU storage for visual generation offload",
@@ -262,26 +266,42 @@ def test_initialize_reports_cuda_arena_allocation_hint():
     assert "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" in message
 
 
-def test_copy_to_cpu_storage_reports_tensor_context():
-    group = _ToyModule(weight_value=1.0, bias_value=10.0)
+def test_initialize_allocates_group_cpu_storage_after_gpu_rebind():
+    group_a = _ToyModule(weight_value=1.0, bias_value=10.0)
+    group_b = _ToyModule(weight_value=2.0, bias_value=20.0)
     manager = ModuleOffloadManager(
-        groups={"group": group},
+        groups={
+            "group_a": group_a,
+            "group_b": group_b,
+        },
         device="cpu",
         pin_memory=False,
     )
-    layout = manager._collect_group_layout("group", group, 0)
-    manager.cpu_storage = torch.empty(0, dtype=torch.uint8, device="cpu")
+    events = []
+    original_rebind_to_gpu = manager._rebind_to_gpu
+    original_allocate_cpu_storage = manager._allocate_cpu_storage
 
-    with pytest.raises(
-        RuntimeError,
-        match=r"Failed to copy offload tensor 'group\.weight'",
-    ) as exc_info:
-        manager._copy_group_to_cpu_storage(layout)
+    def record_rebind_to_gpu(name):
+        events.append(("rebind_gpu", name))
+        return original_rebind_to_gpu(name)
 
-    message = str(exc_info.value)
-    assert "Failed to copy offload tensor 'group.weight'" in message
-    assert "to packed CPU storage at offset 0" in message
-    assert "dtype=torch.float32" in message
+    def record_allocate_cpu_storage(num_bytes, group_name=None):
+        events.append(("allocate_cpu", group_name))
+        return original_allocate_cpu_storage(num_bytes, group_name=group_name)
+
+    with (
+        patch.object(manager, "_rebind_to_gpu", side_effect=record_rebind_to_gpu),
+        patch.object(
+            manager,
+            "_allocate_cpu_storage",
+            side_effect=record_allocate_cpu_storage,
+        ),
+        patch.object(manager, "_trim_host_allocator"),
+    ):
+        manager.initialize()
+
+    assert events.index(("rebind_gpu", "group_a")) < events.index(("allocate_cpu", "group_a"))
+    assert events.index(("rebind_gpu", "group_b")) < events.index(("allocate_cpu", "group_b"))
 
 
 def test_packed_tensor_views_are_sufficiently_aligned():
@@ -295,8 +315,7 @@ def test_packed_tensor_views_are_sufficiently_aligned():
 
     layout = manager.layouts["group"]
     for spec in layout.specs:
-        assert spec.cpu_offset % 16 == 0
-        assert spec.gpu_offset % 16 == 0
+        assert spec.offset % 16 == 0
 
     manager.stage("group")
     assert group.prefix.data_ptr() % 16 == 0
@@ -328,9 +347,13 @@ def test_offload_pipeline_context_stages_requested_group():
 
 def test_inactive_group_stays_cpu_backed_after_staging_another_group():
     manager, group_a, group_b = _make_manager()
-    assert manager.cpu_storage is not None
     assert manager.gpu_arena is not None
-    cpu_storage_ptr = _storage_ptr(manager.cpu_storage)
+    group_a_cpu_storage = manager.layouts["group_a"].cpu_storage
+    group_b_cpu_storage = manager.layouts["group_b"].cpu_storage
+    assert group_a_cpu_storage is not None
+    assert group_b_cpu_storage is not None
+    group_a_cpu_storage_ptr = _storage_ptr(group_a_cpu_storage)
+    group_b_cpu_storage_ptr = _storage_ptr(group_b_cpu_storage)
     gpu_arena_ptr = _storage_ptr(manager.gpu_arena)
 
     manager.stage("group_a")
@@ -338,16 +361,16 @@ def test_inactive_group_stays_cpu_backed_after_staging_another_group():
     assert manager.active_group_name == "group_a"
     assert _storage_ptr(group_a.weight) == gpu_arena_ptr
     assert _storage_ptr(group_a.bias) == gpu_arena_ptr
-    assert _storage_ptr(group_b.weight) == cpu_storage_ptr
-    assert _storage_ptr(group_b.bias) == cpu_storage_ptr
+    assert _storage_ptr(group_b.weight) == group_b_cpu_storage_ptr
+    assert _storage_ptr(group_b.bias) == group_b_cpu_storage_ptr
     torch.testing.assert_close(group_b.weight, torch.full((2, 2), 2.0))
     torch.testing.assert_close(group_b.bias, torch.full((2,), 20.0))
 
     manager.stage("group_b")
 
     assert manager.active_group_name == "group_b"
-    assert _storage_ptr(group_a.weight) == cpu_storage_ptr
-    assert _storage_ptr(group_a.bias) == cpu_storage_ptr
+    assert _storage_ptr(group_a.weight) == group_a_cpu_storage_ptr
+    assert _storage_ptr(group_a.bias) == group_a_cpu_storage_ptr
     assert _storage_ptr(group_b.weight) == gpu_arena_ptr
     assert _storage_ptr(group_b.bias) == gpu_arena_ptr
     torch.testing.assert_close(group_a.weight, torch.full((2, 2), 1.0))
