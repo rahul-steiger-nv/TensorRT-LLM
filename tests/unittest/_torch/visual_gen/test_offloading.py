@@ -266,7 +266,7 @@ def test_initialize_reports_cuda_arena_allocation_hint():
     assert "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" in message
 
 
-def test_initialize_allocates_group_cpu_storage_after_gpu_rebind():
+def test_initialize_packs_group_before_rebinding_to_cpu():
     group_a = _ToyModule(weight_value=1.0, bias_value=10.0)
     group_b = _ToyModule(weight_value=2.0, bias_value=20.0)
     manager = ModuleOffloadManager(
@@ -278,30 +278,29 @@ def test_initialize_allocates_group_cpu_storage_after_gpu_rebind():
         pin_memory=False,
     )
     events = []
-    original_rebind_to_gpu = manager._rebind_to_gpu
+    original_rebind_to_cpu = manager._rebind_to_cpu
     original_allocate_cpu_storage = manager._allocate_cpu_storage
 
-    def record_rebind_to_gpu(name):
-        events.append(("rebind_gpu", name))
-        return original_rebind_to_gpu(name)
+    def record_rebind_to_cpu(name):
+        events.append(("rebind_cpu", name))
+        return original_rebind_to_cpu(name)
 
     def record_allocate_cpu_storage(num_bytes, group_name=None):
         events.append(("allocate_cpu", group_name))
         return original_allocate_cpu_storage(num_bytes, group_name=group_name)
 
     with (
-        patch.object(manager, "_rebind_to_gpu", side_effect=record_rebind_to_gpu),
+        patch.object(manager, "_rebind_to_cpu", side_effect=record_rebind_to_cpu),
         patch.object(
             manager,
             "_allocate_cpu_storage",
             side_effect=record_allocate_cpu_storage,
         ),
-        patch.object(manager, "_trim_host_allocator"),
     ):
         manager.initialize()
 
-    assert events.index(("rebind_gpu", "group_a")) < events.index(("allocate_cpu", "group_a"))
-    assert events.index(("rebind_gpu", "group_b")) < events.index(("allocate_cpu", "group_b"))
+    assert events.index(("allocate_cpu", "group_a")) < events.index(("rebind_cpu", "group_a"))
+    assert events.index(("allocate_cpu", "group_b")) < events.index(("rebind_cpu", "group_b"))
 
 
 def test_packed_tensor_views_are_sufficiently_aligned():
