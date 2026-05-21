@@ -38,13 +38,13 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 ### Feature Matrix
 
-| Model | FP8 blockwise | NVFP4 | TeaCache | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve |
-|---|---|---|---|---|---|---|---|---|---|
-| **FLUX.1** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes |
-| **FLUX.2** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes |
-| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
-| **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes |
+| Model | FP8 blockwise | NVFP4 | TeaCache | CPU Offloading | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **FLUX.1** | Yes | Yes | Yes | No | No [^1] | Yes | No | Yes | Yes | Yes |
+| **FLUX.2** | Yes | Yes | Yes | No | No [^1] | Yes | No | Yes | Yes | Yes |
+| **Wan 2.1** | Yes | Yes | Yes | T2V only | Yes | Yes | Yes | Yes | Yes | Yes |
+| **Wan 2.2** | Yes | Yes | No | T2V only | Yes | Yes | Yes | Yes | Yes | Yes |
+| **LTX-2** | Yes | Yes | No | No | Yes | Yes | No | No | Yes | Yes |
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 
@@ -114,59 +114,7 @@ TeaCache caches transformer outputs when timestep embeddings change slowly betwe
 
 ### CPU Offloading (Wan T2V only)
 
-CPU offloading reduces peak GPU memory usage by staging selected pipeline
-components between CPU and GPU. It is currently supported on Wan text-to-video
-pipelines (`WanPipeline`); the Wan image-to-video pipeline does not yet wrap
-its VAE and text encoder call sites with the offload context, so offloading is
-not supported there. CUDA graphs are not supported together with offloading.
-
-Enable the default Wan T2V offload stages with `--enable_offloading`:
-
-```bash
-python visual_gen_wan_t2v.py \
-    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
-    --prompt "A cute cat playing piano" \
-    --height 480 --width 832 --num_frames 33 \
-    --enable_offloading \
-    --output_path output_offloaded.avi
-```
-
-For single-transformer Wan T2V models (Wan 2.1 T2V and Wan 2.2 TI2V-5B), the
-default stages the text encoder and `transformer.blocks` between CPU and GPU.
-For Wan 2.2 A14B T2V it also stages `transformer_2.blocks`.
-
-Pass an extra VisualGen YAML config to include the VAE in the offloaded stages:
-
-```bash
-python visual_gen_wan_t2v.py \
-    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
-    --prompt "A cute cat playing piano" \
-    --height 480 --width 832 --num_frames 33 \
-    --enable_offloading \
-    --extra_visual_gen_options configs/wan-t2v-cpu-offload.yaml \
-    --output_path output_offloaded.avi
-```
-
-To choose specific pipeline components, pass a YAML config to a Wan T2V
-pipeline through `--extra_visual_gen_options`:
-
-```yaml
-pipeline:
-  enable_offloading: true
-  offload_device: cpu
-  offload_stages:
-    - text_encoder
-    - transformer.blocks
-    - transformer_2.blocks  # Wan 2.2 A14B only; ignored otherwise.
-    - vae
-cuda_graph:
-  enable_cuda_graph: false
-```
-
-Unavailable parts are ignored, so `transformer_2.blocks` is used by Wan 2.2
-A14B and skipped for single-transformer Wan T2V models. Listing `vae` or
-`text_encoder` on non-T2V pipelines is not supported and may produce incorrect
-results.
+CPU offloading stages selected Wan T2V pipeline components between CPU and GPU to reduce peak GPU memory usage; enable it with `pipeline.enable_offloading: true` or `--enable_offloading` in the example script.
 
 ### Multi-GPU Parallelism
 

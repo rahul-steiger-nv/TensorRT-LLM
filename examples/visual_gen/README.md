@@ -314,6 +314,7 @@ python visual_gen_ltx2.py \
 | `--image` | — | ✓ | None | Input image for image-to-video |
 | `--image_cond_strength` | — | ✓ | 1.0 | Image conditioning strength |
 | `--enable_teacache` | ✓ | ✓ | — | False | Cache optimization |
+| `--enable_offloading` | — | ✓ | — | False | Wan T2V CPU offloading |
 | `--teacache_thresh` | ✓ | ✓ | — | 0.2 | TeaCache similarity threshold |
 | `--attention_backend` | ✓ | ✓ | — | VANILLA | `VANILLA`, `TRTLLM`, or `FA4` |
 | `--cfg_size` | — | ✓ | — | 1 | CFG parallelism |
