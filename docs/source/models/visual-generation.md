@@ -114,7 +114,7 @@ TeaCache caches transformer outputs when timestep embeddings change slowly betwe
 
 ### CPU Offloading (Wan T2V only)
 
-CPU offloading stages selected Wan T2V pipeline components between CPU and GPU to reduce peak GPU memory usage; enable it with `pipeline.enable_offloading: true` or `--enable_offloading` in the example script.
+CPU offloading stages move selected Wan T2V pipeline components between CPU and GPU to reduce peak GPU memory usage; enable it with `pipeline.enable_offloading: true` or `--enable_offloading` in the example script.
 
 ### Multi-GPU Parallelism
 
