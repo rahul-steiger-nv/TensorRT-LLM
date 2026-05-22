@@ -13,11 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# CPU offload selected Wan T2V pipeline components.
-# Shared by offline examples (--extra_visual_gen_options) and trtllm-serve.
+# CPU offload selected Wan 2.2 T2V pipeline components.
+# For trtllm-serve and benchmark scripts that consume --extra_visual_gen_options.
 # Supported only on Wan text-to-video pipelines (WanPipeline). The Wan I2V
 # pipeline does not yet wrap its VAE/text encoder call sites with the offload
-# context — do not enable `vae`/`text_encoder` offloading there.
+# context -- do not enable `vae`/`text_encoder` offloading there.
 pipeline:
   enable_offloading: true
   offload_device: cpu
@@ -25,7 +25,7 @@ pipeline:
   offload_stages:
     - text_encoder
     - transformer.blocks
-    - transformer_2.blocks  # Wan 2.2 A14B only; ignored otherwise.
+    - transformer_2.blocks
     - vae
 cuda_graph:
   enable_cuda_graph: false

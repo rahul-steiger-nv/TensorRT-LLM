@@ -277,7 +277,7 @@ class PipelineLoader:
         helper mirrors the pipeline's configured stages so offloaded towers never
         need to materialize on GPU first.
         """
-        available_parts = pipeline.collect_offload_pipeline_parts()
+        available_parts = pipeline.offload_pipeline_parts()
         modules: list[torch.nn.Module] = []
         seen: set[int] = set()
 

@@ -338,10 +338,18 @@ class ModuleOffloadManager:
     ) -> None:
         for spec, view in zip(layout.specs, views, strict=True):
             if spec.is_parameter:
-                assert isinstance(view, nn.Parameter)
+                if not isinstance(view, nn.Parameter):
+                    raise TypeError(
+                        f"Expected offload view '{spec.name}' to be an nn.Parameter, "
+                        f"got {type(view).__name__}"
+                    )
                 spec.owner.register_parameter(spec.name, view)
             else:
-                assert isinstance(view, torch.Tensor)
+                if not isinstance(view, torch.Tensor):
+                    raise TypeError(
+                        f"Expected offload view '{spec.name}' to be a torch.Tensor, "
+                        f"got {type(view).__name__}"
+                    )
                 spec.owner.register_buffer(spec.name, view, persistent=spec.persistent)
 
     def initialize(self) -> None:

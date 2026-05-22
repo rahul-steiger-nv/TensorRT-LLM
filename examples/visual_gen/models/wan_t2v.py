@@ -17,13 +17,22 @@
 
 Usage:
     python wan_t2v.py
-    python wan_t2v.py --extra_visual_gen_options ../configs/wan2.2-t2v-fp4-1gpu.yaml
+    python wan_t2v.py --enable_offloading --offload_stages text_encoder,transformer.blocks,transformer_2.blocks,vae
 """
 
 import argparse
 
 from tensorrt_llm import VisualGen, VisualGenArgs
 from tensorrt_llm.serve.media_storage import MediaStorage
+
+
+def _parse_offload_stages(offload_stages: str | None) -> list[str] | None:
+    if offload_stages is None:
+        return None
+    stages = [stage.strip() for stage in offload_stages.split(",") if stage.strip()]
+    if not stages:
+        raise ValueError("--offload_stages must contain at least one stage name")
+    return stages
 
 
 def main():
@@ -35,10 +44,19 @@ def main():
         help="Model path or HuggingFace Hub ID",
     )
     parser.add_argument(
-        "--extra_visual_gen_options",
+        "--enable_offloading",
+        action="store_true",
+        help="Enable Wan T2V text-encoder/transformer-block CPU offloading.",
+    )
+    parser.add_argument(
+        "--offload_stages",
         type=str,
         default=None,
-        help="Path to YAML config (same as trtllm-serve --extra_visual_gen_options)",
+        help=(
+            "Comma-separated offload stage names, e.g. "
+            "text_encoder,transformer.blocks,transformer_2.blocks,vae. "
+            "Implies --enable_offloading."
+        ),
     )
     parser.add_argument(
         "--output_path",
@@ -48,13 +66,19 @@ def main():
     )
     args = parser.parse_args()
 
-    # Engine config from shared YAML (optional); model-specific defaults apply otherwise.
-    extra_args = (
-        VisualGenArgs.from_yaml(args.extra_visual_gen_options)
-        if args.extra_visual_gen_options
-        else None
-    )
-    visual_gen = VisualGen(model=args.model, args=extra_args)
+    kwargs = {}
+    offload_stages = _parse_offload_stages(args.offload_stages)
+    if args.enable_offloading or offload_stages is not None:
+        pipeline_kwargs = {
+            "enable_offloading": True,
+            "offload_device": "cpu",
+        }
+        if offload_stages is not None:
+            pipeline_kwargs["offload_stages"] = offload_stages
+        kwargs["pipeline"] = pipeline_kwargs
+
+    visual_gen_args = VisualGenArgs(**kwargs) if kwargs else None
+    visual_gen = VisualGen(model=args.model, args=visual_gen_args)
 
     # --- Model-specific: T2V request construction ---
     # Query per-model defaults (resolution, steps, guidance, seed, etc.).

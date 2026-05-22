@@ -150,7 +150,7 @@ def test_configured_offload_stages_override_model_defaults_and_expose_vae():
         ("transformer_2.blocks",),
     )
 
-    parts = pipeline.collect_offload_pipeline_parts()
+    parts = pipeline.offload_pipeline_parts()
     assert parts["text_encoder"] is pipeline.text_encoder
     assert parts["transformer.blocks"] is pipeline.transformer.blocks
     assert parts["vae"] is pipeline.vae

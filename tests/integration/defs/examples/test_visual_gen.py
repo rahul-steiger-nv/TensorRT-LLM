@@ -766,16 +766,15 @@ def test_visual_gen_quickstart(_visual_gen_deps, llm_root, llm_venv):
 
 
 # =============================================================================
-# Core example tests — run per-model scripts from examples/visual_gen/models/
-# with shared YAML configs from examples/visual_gen/configs/.
+# Core example tests — run per-model scripts from examples/visual_gen/models/.
 # =============================================================================
 
 
 def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
-    """Run examples/visual_gen/models/wan_t2v.py with NVFP4 config end-to-end.
+    """Run examples/visual_gen/models/wan_t2v.py end-to-end.
 
     This is a core example test: it validates that the per-model example script
-    and the shared YAML config work together as documented in the README.
+    works as documented in the README.
     Uses the pre-quantized Wan 2.2 T2V A14B NVFP4 checkpoint.
 
     NOTE: If a strict-duplicate test exists elsewhere (same model, same quant,
@@ -798,11 +797,7 @@ def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
     output_path = os.path.join(out_dir, "wan_t2v_output.mp4")
 
     script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "wan_t2v.py")
-    config_path = os.path.join(
-        llm_root, "examples", "visual_gen", "configs", "wan2.2-t2v-fp4-1gpu.yaml"
-    )
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
-    assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
     venv_check_call(
         llm_venv,
@@ -810,8 +805,6 @@ def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
             script_path,
             "--model",
             model_path,
-            "--extra_visual_gen_options",
-            config_path,
             "--output_path",
             output_path,
         ],

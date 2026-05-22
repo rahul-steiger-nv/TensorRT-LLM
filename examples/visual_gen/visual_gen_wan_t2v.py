@@ -7,8 +7,6 @@
 import argparse
 import time
 
-import yaml
-
 from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams, logger
 from tensorrt_llm._torch.visual_gen.config import CacheDiTConfig, TeaCacheConfig
 from tensorrt_llm.serve.media_storage import MediaStorage
@@ -33,12 +31,6 @@ def parse_args():
         type=str,
         default=None,
         help="HuggingFace Hub revision (branch, tag, or commit SHA)",
-    )
-    parser.add_argument(
-        "--extra_visual_gen_options",
-        type=str,
-        default=None,
-        help="Path to a YAML file with extra VisualGen pipeline options.",
     )
     parser.add_argument("--prompt", type=str, required=True, help="Text prompt for generation")
     parser.add_argument(
@@ -245,6 +237,16 @@ def parse_args():
         action="store_true",
         help="Enable Wan T2V text-encoder/transformer-block CPU offloading.",
     )
+    parser.add_argument(
+        "--offload_stages",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated offload stage names, e.g. "
+            "text_encoder,transformer.blocks,transformer_2.blocks,vae. "
+            "Implies --enable_offloading."
+        ),
+    )
 
     # CUDA graph
     parser.add_argument(
@@ -319,18 +321,22 @@ def _cache_dit_config_from_args(args) -> CacheDiTConfig:
     return CacheDiTConfig(**overrides)
 
 
-def _load_extra_pipeline_options(config_path: str | None) -> dict:
-    if config_path is None:
-        return {}
-    with open(config_path, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f) or {}
-    if not isinstance(config, dict):
-        raise ValueError(f"Expected a YAML mapping in {config_path}")
-    pipeline_options = config.get("pipeline", {})
-    if not isinstance(pipeline_options, dict):
-        raise ValueError(f"Expected 'pipeline' to be a mapping in {config_path}")
-    return pipeline_options
+def _parse_offload_stages(offload_stages: str | None) -> list[str] | None:
+    if offload_stages is None:
+        return None
+    stages = [stage.strip() for stage in offload_stages.split(",") if stage.strip()]
+    if not stages:
+        raise ValueError("--offload_stages must contain at least one stage name")
+    return stages
 
+
+def _validate_feature_combinations(args, offload_stages: list[str] | None) -> None:
+    offloading_enabled = args.enable_offloading or offload_stages is not None
+    if args.enable_cudagraph and offloading_enabled:
+        raise ValueError(
+            "CUDA graphs are not supported with Wan T2V offloading. "
+            "Remove --enable_cudagraph or disable offloading."
+        )
 
 def main():
     args = parse_args()
@@ -358,14 +364,19 @@ def main():
     else:
         cache_kwargs = {}
 
-    pipeline_kwargs = _load_extra_pipeline_options(args.extra_visual_gen_options)
+    offload_stages = _parse_offload_stages(args.offload_stages)
+    _validate_feature_combinations(args, offload_stages)
+
+    pipeline_kwargs = {}
     pipeline_kwargs.setdefault("offload_device", "cpu")
     if args.enable_layerwise_nvtx_marker:
         pipeline_kwargs["enable_layerwise_nvtx_marker"] = True
     if args.enable_cuda_memory_logging:
         pipeline_kwargs["enable_cuda_memory_logging"] = True
-    if args.enable_offloading:
+    if args.enable_offloading or offload_stages is not None:
         pipeline_kwargs["enable_offloading"] = True
+    if offload_stages is not None:
+        pipeline_kwargs["offload_stages"] = offload_stages
 
     kwargs = dict(
         revision=args.revision,

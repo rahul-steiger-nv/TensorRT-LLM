@@ -323,7 +323,7 @@ class BasePipeline(nn.Module):
     def default_offload_stages(self) -> tuple[OffloadPipelineStage, ...]:
         """Return model-specific offload stages requested by shorthand config.
 
-        Each stage is a tuple of part names from ``collect_offload_pipeline_parts``.
+        Each stage is a tuple of part names from ``offload_pipeline_parts``.
         Parts in the same stage are staged into the GPU arena together.
         """
         return ()
@@ -362,17 +362,6 @@ class BasePipeline(nn.Module):
                 return "+".join(stage)
         return part_name
 
-    @staticmethod
-    def _offload_group_names_by_part(
-        stages: tuple[OffloadPipelineStage, ...],
-    ) -> dict[str, str]:
-        """Map each part to its initialized offload group name."""
-        return {part: "+".join(stage) for stage in stages for part in stage}
-
-    def offload_pipeline_part_owners(self) -> tuple[Any, ...]:
-        """Return objects that may advertise offloadable parts."""
-        return tuple(self.modules())
-
     def offload_pipeline_parts(self) -> dict[str, nn.Module]:
         """Expose standard component subtrees for offloading."""
         parts: dict[str, nn.Module] = {}
@@ -389,17 +378,6 @@ class BasePipeline(nn.Module):
             blocks = getattr(transformer, "blocks", None) if transformer is not None else None
             if blocks is not None:
                 parts[f"{component_name}.blocks"] = blocks
-        return parts
-
-    def collect_offload_pipeline_parts(self) -> dict[str, nn.Module]:
-        """Collect all named offloadable module subtrees from the pipeline."""
-        parts: dict[str, nn.Module] = {}
-        for owner in self.offload_pipeline_part_owners():
-            if owner is None:
-                continue
-            get_parts = getattr(owner, "offload_pipeline_parts", None)
-            if callable(get_parts):
-                parts.update(get_parts())
         return parts
 
     def _filter_available_offload_stages(
@@ -439,7 +417,7 @@ class BasePipeline(nn.Module):
         if not configured_stages or self._offload_pipeline is not None:
             return
 
-        available_parts = self.collect_offload_pipeline_parts()
+        available_parts = self.offload_pipeline_parts()
         stages = self._filter_available_offload_stages(configured_stages, available_parts)
         if not stages:
             return
@@ -463,7 +441,9 @@ class BasePipeline(nn.Module):
         )
         offload_pipeline.initialize()
         self._offload_pipeline = offload_pipeline
-        self._offload_group_name_by_part = self._offload_group_names_by_part(stages)
+        self._offload_group_name_by_part = {
+            part: "+".join(stage) for stage in stages for part in stage
+        }
 
     def _apply_teacache_coefficients(self, coefficients: Optional[Dict]) -> None:
         """Pick TeaCache coefficients from checkpoint path; updates model_config.teacache in place."""

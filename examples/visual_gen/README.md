@@ -9,7 +9,7 @@ about the details of the feature.
 | Directory | Purpose |
 |-----------|---------|
 | [`models/`](models/) | Per-model example scripts — slim API examples (~40 lines) that focus on model-specific request construction and output processing |
-| [`configs/`](configs/) | YAML configs shared by offline examples (`--extra_visual_gen_options`) and `trtllm-serve` |
+| [`configs/`](configs/) | YAML configs for `trtllm-serve` and benchmark scripts |
 | [`serve/`](serve/) | `trtllm-serve` usage, benchmarking, and client examples |
 
 ## Quick Start
@@ -19,18 +19,14 @@ about the details of the feature.
 ## Per-Model Examples
 
 Each script under `models/` demonstrates a single model with the VisualGen API.
-Engine config (quantization, parallelism, TeaCache, etc.) is an optional YAML
-file passed via `--extra_visual_gen_options` — the same flag that `trtllm-serve` uses.
+Common engine options can be passed directly as script arguments.
 
 ```bash
 # Default: 1 GPU, model defaults
 python models/wan_t2v.py
 
-# With a shared config for NVFP4 quantization
-python models/wan_t2v.py --extra_visual_gen_options configs/wan2.2-t2v-fp4-1gpu.yaml
-
-# With a shared config for CPU offloading, including VAE offload
-python models/wan_t2v.py --extra_visual_gen_options configs/wan-t2v-cpu-offload.yaml
+# With CPU offloading, including VAE offload
+python models/wan_t2v.py --offload_stages text_encoder,transformer.blocks,transformer_2.blocks,vae
 ```
 
 ## Prerequisites
@@ -111,14 +107,14 @@ python visual_gen_wan_t2v.py \
     --output_path output_offloaded.avi
 ```
 
-Pass an extra VisualGen YAML config to include the VAE in the offloaded stages:
+Pass comma-separated offload stages to include the VAE:
 ```bash
 python visual_gen_wan_t2v.py \
     --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --prompt "A cute cat playing piano" \
     --height 480 --width 832 --num_frames 33 \
     --enable_offloading \
-    --extra_visual_gen_options configs/wan-t2v-cpu-offload.yaml \
+    --offload_stages text_encoder,transformer.blocks,vae \
     --output_path output_offloaded.avi
 ```
 
@@ -135,7 +131,8 @@ python visual_gen_wan_t2v.py \
 For Wan text-to-video, CPU offloading stages the text encoder and transformer
 blocks between CPU and GPU to reduce peak GPU memory usage. Single-transformer
 models stage `transformer.blocks`; Wan 2.2 A14B stages `transformer.blocks` and
-`transformer_2.blocks` separately. CUDA peak memory logging is disabled by
+`transformer_2.blocks` separately. Use `--offload_stages` with comma-separated
+stage names to override the default stages. CUDA peak memory logging is disabled by
 default; add `--enable_cuda_memory_logging` to log each rank's peak allocator
 memory for development comparisons.
 
