@@ -44,6 +44,8 @@ class PipelineComponent(str, Enum):
     SCHEDULER = "scheduler"
     IMAGE_ENCODER = "image_encoder"
     IMAGE_PROCESSOR = "image_processor"
+    TEXT_GUARDRAIL = "text_guardrail"
+    VIDEO_GUARDRAIL = "video_guardrail"
 
 
 # =============================================================================
@@ -425,6 +427,12 @@ class VisualGenArgs(StrictBaseModel):
             "the stage 2 refinement pass. The LoRA weights are merged into "
             "the transformer for stage 2 denoising and un-merged afterwards."
         ),
+    )
+
+    # Cosmos3 guardrail checkpoint path
+    guardrail_checkpoint_dir: str = PydanticField(
+        "",
+        description="Path to the Cosmos3 guardrail checkpoint container both text and video guardrails.",
     )
 
     # HuggingFace Hub options
@@ -875,6 +883,9 @@ class DiffusionModelConfig(BaseModel):
             extra_attrs["spatial_upsampler_path"] = args.spatial_upsampler_path
         if args and args.distilled_lora_path:
             extra_attrs["distilled_lora_path"] = args.distilled_lora_path
+
+        if args and args.guardrail_checkpoint_dir:
+            extra_attrs["guardrail_checkpoint_dir"] = args.guardrail_checkpoint_dir
 
         # Discover pipeline components (diffusers layout)
         components = discover_pipeline_components(checkpoint_path)
