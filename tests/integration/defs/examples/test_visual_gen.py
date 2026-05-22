@@ -276,7 +276,7 @@ def wan_trtllm_video_path(_visual_gen_deps, llm_venv, llm_root):
     return _generate_wan_video(llm_venv, llm_root, WAN_T2V_MODEL_SUBPATH, "wan")
 
 
-def _generate_wan_video(llm_venv, llm_root, model_subpath, output_subdir):
+def _generate_wan_video(llm_venv, llm_root, model_subpath, output_subdir, extra_args=None):
     """Generate a video with visual_gen_wan_t2v.py for a given model checkpoint.
 
     Returns the path to the generated .mp4, or calls pytest.skip if the model
@@ -313,6 +313,8 @@ def _generate_wan_video(llm_venv, llm_root, model_subpath, output_subdir):
     ]
     if torch.cuda.device_count() >= 2:
         cmd.extend(["--cfg_size", "2"])
+    if extra_args is not None:
+        cmd.extend(extra_args)
     venv_check_call(llm_venv, cmd)
     assert os.path.isfile(output_path), f"Visual gen did not produce {output_path}"
     return output_path
@@ -559,6 +561,19 @@ def test_vbench_dimension_score_wan(vbench_repo_root, wan_trtllm_video_path, llm
         golden_scores=VBENCH_WAN_GOLDEN_SCORES,
         max_score_diff=0.05,
     )
+
+
+def test_wan_t2v_example_with_offloading(_visual_gen_deps, llm_root, llm_venv):
+    """Run the WAN T2V example end-to-end with CPU offloading enabled."""
+    output_path = _generate_wan_video(
+        llm_venv,
+        llm_root,
+        WAN_T2V_MODEL_SUBPATH,
+        "wan_offload",
+        extra_args=["--enable_offloading"],
+    )
+
+    assert os.path.isfile(output_path), "Offloaded WAN TRT-LLM video must exist"
 
 
 def _run_vbench_and_report(
