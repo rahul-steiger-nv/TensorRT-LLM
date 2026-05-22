@@ -44,7 +44,6 @@ from .guardrails import (
 )
 from .transformer_cosmos3 import Cosmos3VFMTransformer
 
-COSMOS3_REASONER_OFFLOAD_STAGE = "transformer.reasoner"
 COSMOS3_LANGUAGE_MODEL_OFFLOAD_STAGE = "transformer.language_model"
 COSMOS3_GEN_LAYERS_OFFLOAD_STAGE = "transformer.gen_layers"
 COSMOS3_DEFAULT_NEGATIVE_PROMPT = (
@@ -80,7 +79,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
     def default_offload_stages(self) -> tuple[tuple[str, ...], ...]:
         return (
-            (COSMOS3_REASONER_OFFLOAD_STAGE,),
+            (COSMOS3_LANGUAGE_MODEL_OFFLOAD_STAGE,),
             (COSMOS3_GEN_LAYERS_OFFLOAD_STAGE,),
         )
 
@@ -94,18 +93,13 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         parts[COSMOS3_GEN_LAYERS_OFFLOAD_STAGE] = self.transformer.gen_layers
         return parts
 
-    def _make_offload_context_factory(self, *stage_names: str):
+    def _make_offload_context_factory(self, stage_name: str):
         requested_parts = self.requested_offload_parts()
-        stage_name = next(
-            (candidate for candidate in stage_names if candidate in requested_parts),
-            stage_names[0],
-        )
         return lambda: self.offload_context(stage_name, enable=stage_name in requested_parts)
 
     def _configure_transformer_offloading(self) -> None:
         self.transformer.set_offload_contexts(
             reasoner_offload_context=self._make_offload_context_factory(
-                COSMOS3_REASONER_OFFLOAD_STAGE,
                 COSMOS3_LANGUAGE_MODEL_OFFLOAD_STAGE,
             ),
             gen_layers_offload_context=self._make_offload_context_factory(
