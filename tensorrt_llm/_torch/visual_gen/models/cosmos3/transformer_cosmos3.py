@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+from contextlib import nullcontext
 from typing import Tuple
 
 import torch
@@ -728,6 +729,8 @@ class Cosmos3VFMTransformer(nn.Module):
 
         self.cached_kv = None
         self.cached_freqs_gen = None
+        self.reasoner_offload_context = nullcontext
+        self.gen_layers_offload_context = nullcontext
 
         self.__post_init__()
 
@@ -851,6 +854,14 @@ class Cosmos3VFMTransformer(nn.Module):
         self.cached_kv = None
         self.cached_freqs_gen = None
 
+    def set_offload_contexts(
+        self,
+        reasoner_offload_context=nullcontext,
+        gen_layers_offload_context=nullcontext,
+    ):
+        self.reasoner_offload_context = reasoner_offload_context
+        self.gen_layers_offload_context = gen_layers_offload_context
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -915,7 +926,8 @@ class Cosmos3VFMTransformer(nn.Module):
                 hidden_states.device,
                 hidden_states.dtype,
             )
-            cached_kv_full = self.language_model(text_ids, text_mask, freqs_und)
+            with self.reasoner_offload_context():
+                cached_kv_full = self.language_model(text_ids, text_mask, freqs_und)
             self.cached_freqs_gen = freqs_gen
 
             if self.use_seq_parallel:
@@ -973,12 +985,13 @@ class Cosmos3VFMTransformer(nn.Module):
         else:
             freqs_gen = self.cached_freqs_gen
 
-        for i, layer in enumerate(self.gen_layers):
-            k_und, v_und = self.cached_kv[i]
-            if self.seq_parallel_size <= 1:
-                k_und = k_und[:, :max_real_len]
-                v_und = v_und[:, :max_real_len]
-            hidden_gen = layer(hidden_gen, k_und, v_und, freqs_gen)
+        with self.gen_layers_offload_context():
+            for i, layer in enumerate(self.gen_layers):
+                k_und, v_und = self.cached_kv[i]
+                if self.seq_parallel_size <= 1:
+                    k_und = k_und[:, :max_real_len]
+                    v_und = v_und[:, :max_real_len]
+                hidden_gen = layer(hidden_gen, k_und, v_und, freqs_gen)
 
         if self.use_seq_parallel:
             hidden_gen = hidden_gen.contiguous()

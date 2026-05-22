@@ -44,6 +44,9 @@ from .guardrails import (
 )
 from .transformer_cosmos3 import Cosmos3VFMTransformer
 
+COSMOS3_REASONER_OFFLOAD_STAGE = "transformer.reasoner"
+COSMOS3_LANGUAGE_MODEL_OFFLOAD_STAGE = "transformer.language_model"
+COSMOS3_GEN_LAYERS_OFFLOAD_STAGE = "transformer.gen_layers"
 COSMOS3_DEFAULT_NEGATIVE_PROMPT = (
     "The video captures a series of frames showing ugly scenes, static with no motion, motion blur, "
     "over-saturation, shaky footage, low resolution, grainy texture, pixelated images, poorly lit areas, "
@@ -75,6 +78,41 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             self.transformer.load_weights(transformer_weights)
             self.transformer.eval()
 
+    def default_offload_stages(self) -> tuple[tuple[str, ...], ...]:
+        return (
+            (COSMOS3_REASONER_OFFLOAD_STAGE,),
+            (COSMOS3_GEN_LAYERS_OFFLOAD_STAGE,),
+        )
+
+    def offload_pipeline_parts(self) -> dict[str, torch.nn.Module]:
+        parts = super().offload_pipeline_parts()
+        if self.transformer is None:
+            return parts
+
+        parts[COSMOS3_REASONER_OFFLOAD_STAGE] = self.transformer.language_model
+        parts[COSMOS3_LANGUAGE_MODEL_OFFLOAD_STAGE] = self.transformer.language_model
+        parts[COSMOS3_GEN_LAYERS_OFFLOAD_STAGE] = self.transformer.gen_layers
+        return parts
+
+    def _make_offload_context_factory(self, *stage_names: str):
+        requested_parts = self.requested_offload_parts()
+        stage_name = next(
+            (candidate for candidate in stage_names if candidate in requested_parts),
+            stage_names[0],
+        )
+        return lambda: self.offload_context(stage_name, enable=stage_name in requested_parts)
+
+    def _configure_transformer_offloading(self) -> None:
+        self.transformer.set_offload_contexts(
+            reasoner_offload_context=self._make_offload_context_factory(
+                COSMOS3_REASONER_OFFLOAD_STAGE,
+                COSMOS3_LANGUAGE_MODEL_OFFLOAD_STAGE,
+            ),
+            gen_layers_offload_context=self._make_offload_context_factory(
+                COSMOS3_GEN_LAYERS_OFFLOAD_STAGE
+            ),
+        )
+
     def load_standard_components(
         self, checkpoint_dir: str, device: torch.device, skip_components: Optional[list] = []
     ) -> None:
@@ -91,11 +129,16 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         if PipelineComponent.VAE not in skip_components:
             logger.info("Loading VAE...")
+            vae_device = (
+                torch.device("cpu")
+                if PipelineComponent.VAE.value in self.requested_offload_parts()
+                else device
+            )
             self.vae = AutoencoderKLWan.from_pretrained(
                 checkpoint_dir,
                 subfolder=PipelineComponent.VAE,
                 torch_dtype=torch.bfloat16,  # load VAE in BF16 for memory saving
-            ).to(device)
+            ).to(vae_device)
 
             self.vae_scale_factor_temporal = getattr(
                 self.vae.config, "scale_factor_temporal", self.vae_scale_factor_temporal
@@ -318,7 +361,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         video = image_tensor.unsqueeze(2).expand(-1, -1, num_frames, -1, -1).contiguous()
         video = video.to(device=self.device, dtype=self.vae.dtype)
 
-        latent = self.vae.encode(video).latent_dist.mode()
+        with self.offload_context(
+            PipelineComponent.VAE.value,
+            enable=PipelineComponent.VAE.value in self.requested_offload_parts(),
+        ):
+            latent = self.vae.encode(video).latent_dist.mode()
 
         # Normalize (inverse of _decode_latents denormalization)
         if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
@@ -557,6 +604,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         # 3. Set up scheduler
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
+        self._configure_transformer_offloading()
 
         # 4. Build forward_fn for the denoise loop
         def forward_fn(
@@ -609,7 +657,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             latents = latents.clone()
             latents[:, :, 0:1, :, :] = image_latent.to(device=latents.device, dtype=latents.dtype)
 
-        video = self.decode_latents(latents, self._decode_latents)
+        with self.offload_context(
+            PipelineComponent.VAE.value,
+            enable=PipelineComponent.VAE.value in self.requested_offload_parts(),
+        ):
+            video = self.decode_latents(latents, self._decode_latents)
 
         # Video guardrails
         if self.rank == 0:
