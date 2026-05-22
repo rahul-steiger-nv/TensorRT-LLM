@@ -138,7 +138,7 @@ class WanPipeline(BasePipeline):
 
     @property
     def device(self):
-        return self.transformer.device
+        return super().device
 
     @property
     def transformer_components(self) -> list[str]:

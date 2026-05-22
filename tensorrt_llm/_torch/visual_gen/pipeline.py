@@ -63,6 +63,7 @@ class BasePipeline(nn.Module):
         self.model_config = model_config
         self.config = model_config.pretrained_config
         self.mapping: Mapping = getattr(model_config, "mapping", None) or Mapping()
+        self._device = torch.device(getattr(model_config, "device", "cuda"))
         self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
         self._offload_pipeline: Optional[OffloadPipeline] = None
         self._offload_group_name_by_part: dict[str, str] = {}
@@ -138,7 +139,7 @@ class BasePipeline(nn.Module):
 
     @property
     def device(self):
-        return self.transformer.device
+        return self._device
 
     @property
     def transformer_components(self) -> list[str]:

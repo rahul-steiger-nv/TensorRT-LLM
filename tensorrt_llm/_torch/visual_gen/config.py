@@ -598,6 +598,7 @@ class DiffusionModelConfig(BaseModel):
 
     # Unified parallelism mapping (populated by setup_visual_gen_mapping)
     visual_gen_mapping: Optional[Any] = None  # VisualGenMapping (lazy import)
+    device: str = "cuda"
 
     # VAE parallelism (promoted from ParallelConfig for pipeline_loader)
     enable_parallel_vae: bool = True
@@ -977,6 +978,8 @@ class DiffusionModelConfig(BaseModel):
             create_attention_metadata_state() if attention_cfg.backend == "TRTLLM" else None
         )
 
+        device = kwargs.pop("device", args.device if args is not None else "cuda")
+
         return cls(
             pretrained_config=pretrained_config,
             quant_config=quant_config,
@@ -992,6 +995,7 @@ class DiffusionModelConfig(BaseModel):
             attention_metadata_state=attention_metadata_state,
             parallel=parallel_cfg,
             cache=cache_cfg,
+            device=device,
             skip_create_weights_in_init=True,
             extra_attrs=extra_attrs,
             **kwargs,

@@ -77,9 +77,11 @@ def _make_config(
     *,
     enable_offloading: bool = True,
     offload_stages: list[str | list[str]] | None = None,
+    device: str = "cuda",
 ):
     return SimpleNamespace(
         pretrained_config=SimpleNamespace(),
+        device=device,
         cuda_graph=SimpleNamespace(enable_cuda_graph=False),
         torch_compile=SimpleNamespace(enable_torch_compile=False),
         pipeline=PipelineConfig(
@@ -87,6 +89,13 @@ def _make_config(
             offload_stages=offload_stages,
         ),
     )
+
+
+def test_pipeline_device_uses_config_not_transformer_parameter_device():
+    pipeline = _CustomOffloadPipeline(_make_config(device="cuda:3"))
+
+    assert pipeline.transformer.device == torch.device("cpu")
+    assert pipeline.device == torch.device("cuda:3")
 
 
 def _make_manager() -> tuple[ModuleOffloadManager, _ToyModule, _ToyModule]:
