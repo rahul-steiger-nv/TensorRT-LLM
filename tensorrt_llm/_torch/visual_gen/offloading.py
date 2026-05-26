@@ -21,10 +21,12 @@ arena and the original module parameters/buffers are rebound to views of that
 storage.
 """
 
+import mmap
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Iterator, Mapping, Sequence
+from pathlib import Path
+from typing import Any, Iterator, Mapping, Sequence
 
 import torch
 import torch.nn as nn
@@ -40,12 +42,77 @@ def _format_bytes(num_bytes: int) -> str:
     return f"{num_bytes / (1024**3):.2f} GiB"
 
 
+_CUDA_SUCCESS = 0
+_CUDA_HOST_REGISTER_PORTABLE = 1
+
+
+def _align_host_register_range(ptr: int, nbytes: int) -> tuple[int, int]:
+    page_size = mmap.PAGESIZE
+    aligned_ptr = ptr - (ptr % page_size)
+    aligned_end = ((ptr + nbytes + page_size - 1) // page_size) * page_size
+    return aligned_ptr, aligned_end - aligned_ptr
+
+
+def _cuda_result_is_success(result: Any) -> bool:
+    return result == _CUDA_SUCCESS or str(result) == "cudaError.success"
+
+
+def _cuda_result_to_string(result: Any) -> str:
+    return str(result)
+
+
+def _load_cuda_runtime() -> Any:
+    cudart = torch.cuda.cudart()
+    if not hasattr(cudart, "cudaHostRegister") or not hasattr(cudart, "cudaHostUnregister"):
+        raise AttributeError("torch.cuda.cudart() does not expose host registration APIs")
+    return cudart
+
+
+def _ensure_cuda_context(device: torch.device) -> None:
+    with torch.cuda.device(device):
+        torch.empty(0, device=device)
+
+
+def _register_cuda_host_memory(ptr: int, nbytes: int) -> tuple[Any, str, int, int]:
+    register_ptr, register_nbytes = _align_host_register_range(ptr, nbytes)
+    try:
+        cuda_runtime = _load_cuda_runtime()
+        result = cuda_runtime.cudaHostRegister(
+            register_ptr,
+            register_nbytes,
+            _CUDA_HOST_REGISTER_PORTABLE,
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError) as e:
+        raise RuntimeError(
+            "Unable to CUDA-register shared module offload CPU storage. "
+            "Shared-memory CUDA staging requires registered pinned host memory."
+        ) from e
+
+    if not _cuda_result_is_success(result):
+        raise RuntimeError(
+            "Unable to CUDA-register shared module offload CPU storage: "
+            f"cudaHostRegister returned {_cuda_result_to_string(result)}"
+        )
+
+    return cuda_runtime, "torch.cuda.cudart()", register_ptr, register_nbytes
+
+
 # FlashInfer and other custom kernels can require tensor data pointers to be at
 # least 16-byte aligned even for smaller dtypes such as BF16.
 _PACKED_TENSOR_ALIGNMENT = 16
 
 
 OffloadPipelineStage = tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SharedOffloadStorageConfig:
+    """File-backed CPU storage shared by multiple visual-generation ranks."""
+
+    path: str
+    is_writer: bool
+    process_group: Any | None = None
+    unlink_on_cleanup: bool = False
 
 
 @dataclass
@@ -70,6 +137,7 @@ class _GroupLayout:
     name: str
     nbytes: int
     specs: list[_FlatTensorSpec]
+    shared_offset: int = 0
     cpu_storage: torch.Tensor | None = None
     cpu_views: tuple[nn.Parameter | torch.Tensor, ...] = ()
     gpu_views: tuple[nn.Parameter | torch.Tensor, ...] = ()
@@ -92,16 +160,25 @@ class ModuleOffloadManager:
         groups: Mapping[str, nn.Module],
         device: torch.device | str,
         pin_memory: bool = True,
+        shared_storage: SharedOffloadStorageConfig | None = None,
     ) -> None:
         if not groups:
             raise ValueError("At least one offload group must be provided")
+        if shared_storage is not None and not pin_memory:
+            raise ValueError("Shared visual generation offload requires pinned CPU memory")
 
         self.groups = dict(groups)
         self.device = torch.device(device)
         self.pin_memory = pin_memory
+        self.shared_storage = shared_storage
+        self.shared_cpu_storage: torch.Tensor | None = None
         self.gpu_arena: torch.Tensor | None = None
         self.layouts: dict[str, _GroupLayout] = {}
         self.active_group_name: str | None = None
+        self._cpu_storage_cuda_registered = False
+        self._cuda_runtime: Any | None = None
+        self._cuda_host_register_ptr: int | None = None
+        self._cuda_host_register_nbytes = 0
 
         for name, module in self.groups.items():
             if not name:
@@ -305,6 +382,95 @@ class ModuleOffloadManager:
                 f"pin_memory={self.pin_memory}, groups=[{self._group_size_summary()}])."
             ) from e
 
+    def _barrier(self) -> None:
+        if self.shared_storage is None:
+            return
+        process_group = self.shared_storage.process_group
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(group=process_group) > 1
+        ):
+            torch.distributed.barrier(group=process_group)
+
+    def _allocate_shared_cpu_storage(self, total_cpu_bytes: int) -> torch.Tensor:
+        assert self.shared_storage is not None
+        path = Path(self.shared_storage.path)
+        if self.shared_storage.is_writer:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "wb") as storage_file:
+                storage_file.truncate(total_cpu_bytes)
+        self._barrier()
+
+        logger.info(
+            "Using shared module offload CPU storage at %s (%s, writer=%s)",
+            path,
+            _format_bytes(total_cpu_bytes),
+            self.shared_storage.is_writer,
+        )
+        return torch.from_file(
+            str(path),
+            shared=True,
+            size=total_cpu_bytes,
+            dtype=torch.uint8,
+        )
+
+    def _register_shared_cpu_storage(self) -> None:
+        if self.shared_storage is None or self.device.type != "cuda" or self.shared_cpu_storage is None:
+            return
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "Shared visual generation offload to CUDA requires CUDA to be available "
+                "so the shared CPU storage can be registered as pinned host memory."
+            )
+
+        nbytes = self.shared_cpu_storage.numel() * self.shared_cpu_storage.element_size()
+        if nbytes == 0:
+            return
+
+        try:
+            _ensure_cuda_context(self.device)
+            registration = _register_cuda_host_memory(self.shared_cpu_storage.data_ptr(), nbytes)
+        except RuntimeError as e:
+            raise RuntimeError(
+                "Failed to register shared visual generation offload CPU storage "
+                f"at {self.shared_storage.path} as pinned host memory."
+            ) from e
+
+        cuda_runtime, cuda_host_register_api, register_ptr, register_nbytes = registration
+        self._cuda_runtime = cuda_runtime
+        self._cuda_host_register_ptr = register_ptr
+        self._cuda_host_register_nbytes = register_nbytes
+        self._cpu_storage_cuda_registered = True
+        logger.info(
+            "CUDA-registered shared module offload CPU storage at %s (%s, api=%s)",
+            self.shared_storage.path,
+            _format_bytes(register_nbytes),
+            cuda_host_register_api,
+        )
+
+    def _unregister_shared_cpu_storage(self) -> None:
+        if (
+            not self._cpu_storage_cuda_registered
+            or self._cuda_runtime is None
+            or self._cuda_host_register_ptr is None
+        ):
+            return
+
+        result = self._cuda_runtime.cudaHostUnregister(self._cuda_host_register_ptr)
+        if not _cuda_result_is_success(result):
+            logger.warning(
+                "Unable to CUDA-unregister shared module offload CPU storage at %s: "
+                "%s returned %s.",
+                self.shared_storage.path if self.shared_storage is not None else "<unknown>",
+                "torch.cuda.cudart().cudaHostUnregister",
+                _cuda_result_to_string(result),
+            )
+        self._cpu_storage_cuda_registered = False
+        self._cuda_host_register_ptr = None
+        self._cuda_host_register_nbytes = 0
+        self._cuda_runtime = None
+
     def _allocate_gpu_arena(self, num_bytes: int) -> torch.Tensor:
         try:
             return torch.empty(num_bytes, dtype=torch.uint8, device=self.device)
@@ -350,11 +516,14 @@ class ModuleOffloadManager:
             raise RuntimeError("ModuleOffloadManager has already been initialized")
 
         start_time = time.time()
+        shared_offset = 0
         for name, module in self.groups.items():
             layout = self._collect_group_layout(name, module)
+            layout.shared_offset = shared_offset
             self.layouts[name] = layout
+            shared_offset = _align_offset(shared_offset + layout.nbytes)
 
-        total_cpu_bytes = sum(layout.nbytes for layout in self.layouts.values())
+        total_cpu_bytes = shared_offset
         max_gpu_bytes = max(layout.nbytes for layout in self.layouts.values())
         logger.info(
             "Module offload storage layout: "
@@ -363,18 +532,39 @@ class ModuleOffloadManager:
             f"groups=[{self._group_size_summary()}], device={self.device}"
         )
 
-        # Pack and rebind one group at a time. This keeps setup simple and fast:
-        # offloading requires enough host memory to allocate one group's packed
-        # CPU storage before that group's original tensors are released.
-        for layout in self.layouts.values():
-            logger.info(
-                "Module offload packing group into CPU storage: "
-                f"{layout.name} ({_format_bytes(layout.nbytes)})"
-            )
-            layout.cpu_storage = self._allocate_cpu_storage(layout.nbytes, group_name=layout.name)
-            self._copy_group_to_cpu_storage(layout)
-            layout.cpu_views = self._make_views(layout, layout.cpu_storage)
-            self._rebind_to_cpu(layout.name)
+        if self.shared_storage is None:
+            # Pack and rebind one group at a time. This preserves the reviewed
+            # explicit offload behavior and keeps peak host memory bounded by
+            # the current group being packed.
+            for layout in self.layouts.values():
+                logger.info(
+                    "Module offload packing group into CPU storage: "
+                    f"{layout.name} ({_format_bytes(layout.nbytes)})"
+                )
+                layout.cpu_storage = self._allocate_cpu_storage(layout.nbytes, group_name=layout.name)
+                self._copy_group_to_cpu_storage(layout)
+                layout.cpu_views = self._make_views(layout, layout.cpu_storage)
+                self._rebind_to_cpu(layout.name)
+        else:
+            self.shared_cpu_storage = self._allocate_shared_cpu_storage(total_cpu_bytes)
+            for layout in self.layouts.values():
+                layout.cpu_storage = self.shared_cpu_storage.narrow(
+                    0,
+                    layout.shared_offset,
+                    layout.nbytes,
+                )
+                if self.shared_storage.is_writer:
+                    logger.info(
+                        "Module offload packing group into shared CPU storage: "
+                        f"{layout.name} ({_format_bytes(layout.nbytes)})"
+                    )
+                    self._copy_group_to_cpu_storage(layout)
+            self._barrier()
+            self._register_shared_cpu_storage()
+            for layout in self.layouts.values():
+                assert layout.cpu_storage is not None
+                layout.cpu_views = self._make_views(layout, layout.cpu_storage)
+                self._rebind_to_cpu(layout.name)
 
         self.gpu_arena = self._allocate_gpu_arena(max_gpu_bytes)
         for layout in self.layouts.values():
@@ -405,7 +595,8 @@ class ModuleOffloadManager:
         src = layout.cpu_storage.narrow(0, 0, layout.nbytes)
         dst = self.gpu_arena.narrow(0, 0, layout.nbytes)
         try:
-            dst.copy_(src, non_blocking=layout.cpu_storage.is_pinned())
+            non_blocking = layout.cpu_storage.is_pinned() or self._cpu_storage_cuda_registered
+            dst.copy_(src, non_blocking=non_blocking)
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
         except RuntimeError as e:
@@ -428,6 +619,20 @@ class ModuleOffloadManager:
             raise RuntimeError("ModuleOffloadManager must be initialized before staging")
         self._bind_views(layout, layout.gpu_views)
 
+    def cleanup(self) -> None:
+        """Release process-local registrations and writer-owned shared files."""
+        self._unregister_shared_cpu_storage()
+        if self.shared_storage is None or not self.shared_storage.unlink_on_cleanup:
+            return
+        try:
+            Path(self.shared_storage.path).unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning(
+                "Failed to unlink shared module offload CPU storage %s: %s",
+                self.shared_storage.path,
+                e,
+            )
+
 
 class OffloadPipeline:
     """Stage offload groups explicitly from model call-site contexts.
@@ -443,6 +648,7 @@ class OffloadPipeline:
         parts: Mapping[str, nn.Module],
         device: torch.device | str,
         pin_memory: bool = True,
+        shared_storage: SharedOffloadStorageConfig | None = None,
     ) -> None:
         if not stages:
             raise ValueError("At least one offload pipeline stage must be provided")
@@ -451,10 +657,12 @@ class OffloadPipeline:
         self.parts = dict(parts)
         self.device = torch.device(device)
         self.pin_memory = pin_memory
+        self.shared_storage = shared_storage
         self.manager = ModuleOffloadManager(
             groups=self._build_groups(),
             device=self.device,
             pin_memory=self.pin_memory,
+            shared_storage=self.shared_storage,
         )
 
     def _build_groups(self) -> dict[str, nn.Module]:
@@ -503,3 +711,4 @@ class OffloadPipeline:
         if self.manager.active_group_name is not None:
             self.manager._rebind_to_cpu(self.manager.active_group_name)
             self.manager.active_group_name = None
+        self.manager.cleanup()

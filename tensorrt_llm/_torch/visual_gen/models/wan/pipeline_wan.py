@@ -203,6 +203,11 @@ class WanPipeline(BasePipeline):
             )
             return ()
 
+        if pipeline_config.offload_shared_memory:
+            if self.transformer_2 is not None:
+                return (("transformer.blocks",), ("transformer_2.blocks",))
+            return (("transformer.blocks",),)
+
         if self.transformer_2 is not None:
             return _WAN_TWO_TRANSFORMER_OFFLOAD_STAGES
         return _WAN_SINGLE_TRANSFORMER_OFFLOAD_STAGES

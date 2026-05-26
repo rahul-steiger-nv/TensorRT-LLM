@@ -26,12 +26,17 @@ class WeightLoader(BaseWeightLoader):
         # Returns: {"transformer": {...}, "transformer_2": {...}}
     """
 
-    def __init__(self, components: Union[str, List[str]] = PipelineComponent.TRANSFORMER):
+    def __init__(
+        self,
+        components: Union[str, List[str]] = PipelineComponent.TRANSFORMER,
+        skip_prefixes: tuple[str, ...] = (),
+    ):
         """
         Args:
             components: Component(s) to load weights for. Can be:
                 - Single string: "transformer" (returns flat dict)
                 - List of strings: ["transformer", "transformer_2"] (returns nested dict)
+            skip_prefixes: Weight-name prefixes to skip while reading checkpoint files.
         """
         if isinstance(components, str):
             self.components = [components]
@@ -39,6 +44,7 @@ class WeightLoader(BaseWeightLoader):
         else:
             self.components = components
             self.single_component = False
+        self.skip_prefixes = skip_prefixes
 
     def load_weights(
         self,
@@ -91,7 +97,7 @@ class WeightLoader(BaseWeightLoader):
             component_weights = {}
             desc = f"Loading {component}" if is_pipeline else "Loading checkpoint"
             for wf in tqdm.tqdm(weight_files, desc=desc):
-                component_weights.update(self._load_file(wf))
+                component_weights.update(self._filter_skipped_weights(self._load_file(wf)))
 
             all_weights[component] = component_weights
 
@@ -101,6 +107,23 @@ class WeightLoader(BaseWeightLoader):
 
         # Return nested dict for multiple components
         return all_weights
+
+    def _filter_skipped_weights(self, weights: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.skip_prefixes:
+            return weights
+        filtered = {
+            name: tensor
+            for name, tensor in weights.items()
+            if not name.startswith(self.skip_prefixes)
+        }
+        num_skipped = len(weights) - len(filtered)
+        if num_skipped:
+            logger.info(
+                "Skipped %d visual generation checkpoint tensors with prefixes %s",
+                num_skipped,
+                self.skip_prefixes,
+            )
+        return filtered
 
     def _find_weight_files(self, weight_dir) -> List[str]:
         """Find safetensors or bin weight files.

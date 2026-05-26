@@ -21,10 +21,13 @@ import pytest
 import torch
 import torch.nn as nn
 
+import tensorrt_llm._torch.visual_gen.offloading as offloading
+from tensorrt_llm._torch.visual_gen.checkpoints.weight_loader import WeightLoader
 from tensorrt_llm._torch.visual_gen.config import PipelineConfig, VisualGenArgs
 from tensorrt_llm._torch.visual_gen.offloading import (
     ModuleOffloadManager,
     OffloadPipeline,
+    SharedOffloadStorageConfig,
 )
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 
@@ -77,6 +80,9 @@ def _make_config(
     *,
     enable_offloading: bool = True,
     offload_stages: list[str | list[str]] | None = None,
+    offload_shared_memory: bool = False,
+    offload_shared_memory_path: str = "",
+    offload_shared_memory_scope: str = "ulysses",
 ):
     return SimpleNamespace(
         pretrained_config=SimpleNamespace(),
@@ -85,6 +91,9 @@ def _make_config(
         pipeline=PipelineConfig(
             enable_offloading=enable_offloading,
             offload_stages=offload_stages,
+            offload_shared_memory=offload_shared_memory,
+            offload_shared_memory_path=offload_shared_memory_path,
+            offload_shared_memory_scope=offload_shared_memory_scope,
         ),
     )
 
@@ -106,6 +115,21 @@ def _make_manager() -> tuple[ModuleOffloadManager, _ToyModule, _ToyModule]:
 
 def _storage_ptr(tensor: torch.Tensor) -> int:
     return tensor.untyped_storage().data_ptr()
+
+
+class _FakeCudaRuntime:
+
+    def __init__(self) -> None:
+        self.registered: list[tuple[int, int, int]] = []
+        self.unregistered: list[int] = []
+
+    def cudaHostRegister(self, ptr, nbytes, flags) -> int:
+        self.registered.append((ptr, nbytes, flags))
+        return 0
+
+    def cudaHostUnregister(self, ptr) -> int:
+        self.unregistered.append(ptr)
+        return 0
 
 
 def test_cuda_graphs_with_offload_raise_not_implemented():
@@ -187,6 +211,80 @@ def test_offload_context_uses_filtered_group_when_stage_parts_are_unavailable():
     pipeline.cleanup()
 
 
+def test_pipeline_builds_ulysses_shared_storage_config(tmp_path):
+    pipeline = _CustomOffloadPipeline(
+        _make_config(
+            offload_stages=["transformer.blocks"],
+            offload_shared_memory=True,
+            offload_shared_memory_path=str(tmp_path / "offload.bin"),
+        )
+    )
+    pipeline.model_config.visual_gen_mapping = SimpleNamespace(
+        ulysses_size=2,
+        ulysses_rank=0,
+        ulysses_group=None,
+        cfg_rank=0,
+    )
+
+    shared_storage = pipeline.offload_shared_storage_config(
+        pipeline.offload_stages(),
+    )
+
+    assert shared_storage is not None
+    assert shared_storage.is_writer is True
+    assert shared_storage.path == str(tmp_path / "offload.bin")
+
+
+def test_non_writer_transformer_weight_skip_prefixes(tmp_path):
+    pipeline = _CustomOffloadPipeline(
+        _make_config(
+            offload_stages=["transformer.blocks"],
+            offload_shared_memory=True,
+            offload_shared_memory_path=str(tmp_path / "offload.bin"),
+        )
+    )
+    pipeline.model_config.visual_gen_mapping = SimpleNamespace(
+        ulysses_size=2,
+        ulysses_rank=1,
+        ulysses_group=None,
+        cfg_rank=0,
+    )
+
+    assert pipeline.transformer_weight_skip_prefixes() == ("blocks.",)
+
+
+def test_non_writer_rejects_non_transformer_weight_skip(tmp_path):
+    pipeline = _CustomOffloadPipeline(
+        _make_config(
+            offload_stages=["text_encoder"],
+            offload_shared_memory=True,
+            offload_shared_memory_path=str(tmp_path / "offload.bin"),
+        )
+    )
+    pipeline.model_config.visual_gen_mapping = SimpleNamespace(
+        ulysses_size=2,
+        ulysses_rank=1,
+        ulysses_group=None,
+        cfg_rank=0,
+    )
+
+    with pytest.raises(RuntimeError, match="only skip transformer checkpoint weights"):
+        pipeline.transformer_weight_skip_prefixes()
+
+
+def test_weight_loader_filters_skipped_prefixes():
+    loader = WeightLoader(skip_prefixes=("blocks.",))
+
+    filtered = loader._filter_skipped_weights(
+        {
+            "blocks.0.weight": torch.ones(1),
+            "patch_embedding.weight": torch.ones(1),
+        }
+    )
+
+    assert set(filtered) == {"patch_embedding.weight"}
+
+
 def test_visual_gen_args_loads_yaml_offload_stages(tmp_path):
     config_path = tmp_path / "visual_gen.yaml"
     config_path.write_text(
@@ -207,6 +305,110 @@ pipeline:
         "text_encoder",
         ["transformer.blocks", "vae"],
     ]
+
+
+def test_visual_gen_args_loads_yaml_shared_offload(tmp_path):
+    storage_path = tmp_path / "offload.bin"
+    config_path = tmp_path / "visual_gen.yaml"
+    config_path.write_text(
+        f"""
+pipeline:
+  enable_offloading: true
+  offload_shared_memory: true
+  offload_shared_memory_path: {storage_path}
+  offload_shared_memory_scope: numa
+  offload_stages:
+    - transformer.blocks
+""",
+        encoding="utf-8",
+    )
+
+    args = VisualGenArgs.from_yaml(config_path)
+
+    assert args.pipeline.enable_offloading is True
+    assert args.pipeline.offload_shared_memory is True
+    assert args.pipeline.offload_shared_memory_path == str(storage_path)
+    assert args.pipeline.offload_shared_memory_scope == "numa"
+
+
+def test_shared_offload_storage_reader_does_not_overwrite_writer(tmp_path):
+    storage_path = tmp_path / "offload.bin"
+    writer_group = _ToyModule(weight_value=3.0, bias_value=30.0)
+    reader_group = _ToyModule(weight_value=7.0, bias_value=70.0)
+
+    writer = ModuleOffloadManager(
+        groups={"group": writer_group},
+        device="cpu",
+        pin_memory=True,
+        shared_storage=SharedOffloadStorageConfig(path=str(storage_path), is_writer=True),
+    )
+    writer.initialize()
+
+    reader = ModuleOffloadManager(
+        groups={"group": reader_group},
+        device="cpu",
+        pin_memory=True,
+        shared_storage=SharedOffloadStorageConfig(path=str(storage_path), is_writer=False),
+    )
+    reader.initialize()
+    reader.stage("group")
+
+    torch.testing.assert_close(reader_group.weight, torch.full((2, 2), 3.0))
+    torch.testing.assert_close(reader_group.bias, torch.full((2,), 30.0))
+
+    writer.cleanup()
+    reader.cleanup()
+
+
+def test_shared_offload_requires_pinned_memory(tmp_path):
+    with pytest.raises(ValueError, match="requires pinned CPU memory"):
+        ModuleOffloadManager(
+            groups={"group": _ToyModule(weight_value=1.0, bias_value=10.0)},
+            device="cpu",
+            pin_memory=False,
+            shared_storage=SharedOffloadStorageConfig(
+                path=str(tmp_path / "offload.bin"),
+                is_writer=True,
+            ),
+        )
+
+
+def test_shared_offload_storage_cuda_host_registers_file_mapping(tmp_path, monkeypatch):
+    storage_path = tmp_path / "offload.bin"
+    with open(storage_path, "wb") as storage_file:
+        storage_file.truncate(4096)
+
+    fake_cudart = _FakeCudaRuntime()
+    manager = ModuleOffloadManager(
+        groups={"group": _ToyModule(weight_value=3.0, bias_value=30.0)},
+        device="cuda",
+        pin_memory=True,
+        shared_storage=SharedOffloadStorageConfig(path=str(storage_path), is_writer=False),
+    )
+    manager.shared_cpu_storage = torch.from_file(
+        str(storage_path),
+        shared=True,
+        size=4096,
+        dtype=torch.uint8,
+    )
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(offloading, "_ensure_cuda_context", lambda device: None)
+    monkeypatch.setattr(offloading, "_load_cuda_runtime", lambda: fake_cudart)
+
+    manager._register_shared_cpu_storage()
+
+    assert manager._cpu_storage_cuda_registered
+    assert len(fake_cudart.registered) == 1
+    registered_ptr, registered_nbytes, registered_flags = fake_cudart.registered[0]
+    assert registered_ptr <= manager.shared_cpu_storage.data_ptr()
+    assert registered_nbytes >= manager.shared_cpu_storage.numel()
+    assert registered_flags == offloading._CUDA_HOST_REGISTER_PORTABLE
+
+    manager.cleanup()
+
+    assert not manager._cpu_storage_cuda_registered
+    assert fake_cudart.unregistered == [registered_ptr]
 
 
 def test_initialize_reports_cpu_storage_allocation_context():

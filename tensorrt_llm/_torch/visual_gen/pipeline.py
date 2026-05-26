@@ -1,6 +1,8 @@
 from contextlib import nullcontext
+import hashlib
 import itertools
 import os
+import tempfile
 import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Type
 
@@ -19,7 +21,12 @@ from .checkpoints import WeightLoader
 from .config import PipelineComponent
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
-from .offloading import OffloadPipeline, OffloadPipelineStage
+from .numa import (
+    NumaSharedOffloadContext,
+    add_numa_suffix_to_path,
+    create_numa_shared_offload_context,
+)
+from .offloading import OffloadPipeline, OffloadPipelineStage, SharedOffloadStorageConfig
 
 
 class ExtraParamSchema(StrictBaseModel):
@@ -66,6 +73,8 @@ class BasePipeline(nn.Module):
         self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
         self._offload_pipeline: Optional[OffloadPipeline] = None
         self._offload_group_name_by_part: dict[str, str] = {}
+        self._shared_offload_storage_config: Optional[SharedOffloadStorageConfig] = None
+        self._numa_shared_offload_context: Optional[NumaSharedOffloadContext] = None
         self._parallel_vae_enabled: bool = False
         self._warmed_up_shapes: Set[tuple] = set()
 
@@ -300,8 +309,40 @@ class BasePipeline(nn.Module):
                 f"Checkpoint directory must contain a 'transformer' subdirectory."
             )
 
-        weight_loader = WeightLoader(components=transformer_components)
+        weight_loader = WeightLoader(
+            components=transformer_components,
+            skip_prefixes=self.transformer_weight_skip_prefixes(),
+        )
         return weight_loader.load_weights(checkpoint_dir, self.mapping)
+
+    def transformer_weight_skip_prefixes(self) -> tuple[str, ...]:
+        """Checkpoint prefixes to skip while loading transformer weights."""
+        shared_storage = self.offload_shared_storage_config(
+            self.offload_stages(),
+        )
+        if shared_storage is None or shared_storage.is_writer:
+            return ()
+
+        prefixes: set[str] = set()
+        unsupported_parts: set[str] = set()
+        for part in self.requested_offload_parts():
+            matched_transformer = False
+            for component_name in self.transformer_components:
+                component_prefix = f"{component_name}."
+                if part.startswith(component_prefix):
+                    prefixes.add(f"{part.removeprefix(component_prefix)}.")
+                    matched_transformer = True
+                    break
+            if not matched_transformer:
+                unsupported_parts.add(part)
+
+        if unsupported_parts:
+            raise RuntimeError(
+                "Shared visual generation offload can only skip transformer checkpoint "
+                "weights on non-writer ranks. Remove unsupported offload parts or load "
+                f"them outside shared offload: {sorted(unsupported_parts)}"
+            )
+        return tuple(sorted(prefixes))
 
     def load_standard_components(
         self,
@@ -419,6 +460,102 @@ class BasePipeline(nn.Module):
         del requested_parts
         return torch.device(self.device)
 
+    def _get_numa_shared_offload_context(self) -> NumaSharedOffloadContext | None:
+        if self._numa_shared_offload_context is None:
+            self._numa_shared_offload_context = create_numa_shared_offload_context(
+                require_complete_numa_detection=True,
+            )
+        return self._numa_shared_offload_context
+
+    def _shared_offload_storage_path(
+        self,
+        stages: tuple[OffloadPipelineStage, ...],
+        numa_context: NumaSharedOffloadContext | None = None,
+    ) -> str:
+        pipeline_config = getattr(self.model_config, "pipeline", None)
+        configured_path = getattr(pipeline_config, "offload_shared_memory_path", "")
+        if configured_path:
+            if numa_context is not None:
+                return add_numa_suffix_to_path(
+                    configured_path,
+                    numa_context.group_key[0],
+                    numa_context.group_key[1],
+                )
+            return configured_path
+
+        base_dir = (
+            "/dev/shm"
+            if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK)
+            else tempfile.gettempdir()
+        )
+        vgm = getattr(self.model_config, "visual_gen_mapping", None)
+        pretrained_config = getattr(self.model_config, "pretrained_config", None)
+        model_id = getattr(pretrained_config, "_name_or_path", "") or self.__class__.__name__
+        stage_summary = "|".join("+".join(stage) for stage in stages)
+        numa_key = "" if numa_context is None else f"{numa_context.group_key[0]}:{numa_context.group_key[1]}"
+        token_input = "|".join(
+            (
+                str(model_id),
+                stage_summary,
+                str(getattr(vgm, "cfg_rank", 0)),
+                numa_key,
+                os.environ.get("MASTER_ADDR", ""),
+                os.environ.get("MASTER_PORT", ""),
+                str(self.world_size),
+            )
+        )
+        token = hashlib.sha1(token_input.encode("utf-8")).hexdigest()[:16]
+        return os.path.join(base_dir, f"trtllm_visual_gen_offload_{os.getuid()}_{token}.bin")
+
+    def offload_shared_storage_config(
+        self,
+        stages: tuple[OffloadPipelineStage, ...],
+    ) -> SharedOffloadStorageConfig | None:
+        if not stages:
+            return None
+        if self._shared_offload_storage_config is not None:
+            return self._shared_offload_storage_config
+
+        pipeline_config = getattr(self.model_config, "pipeline", None)
+        if pipeline_config is None or not getattr(pipeline_config, "offload_shared_memory", False):
+            return None
+        if not getattr(pipeline_config, "offload_param_pin_memory", True):
+            raise ValueError("Shared visual generation offload requires offload_param_pin_memory=True")
+        if self.world_size <= 1:
+            return None
+
+        scope = getattr(pipeline_config, "offload_shared_memory_scope", "ulysses")
+        if scope == "numa":
+            context = self._get_numa_shared_offload_context()
+            if context is None:
+                raise RuntimeError(
+                    "NUMA shared visual generation offload was requested, but no NUMA "
+                    "shared offload context could be created."
+                )
+            self._shared_offload_storage_config = SharedOffloadStorageConfig(
+                path=self._shared_offload_storage_path(stages, context),
+                is_writer=self.rank == context.writer_rank,
+                process_group=context.process_group,
+                unlink_on_cleanup=self.rank == context.writer_rank,
+            )
+            return self._shared_offload_storage_config
+
+        vgm = getattr(self.model_config, "visual_gen_mapping", None)
+        ulysses_size = getattr(vgm, "ulysses_size", 1)
+        if ulysses_size <= 1:
+            logger.info(
+                "Shared visual generation offload requested with Ulysses scope, "
+                "but Ulysses parallelism is not active; using rank-local offload storage."
+            )
+            return None
+        self._shared_offload_storage_config = SharedOffloadStorageConfig(
+            path=self._shared_offload_storage_path(stages),
+            is_writer=getattr(vgm, "ulysses_rank", 0) == 0,
+            process_group=getattr(vgm, "ulysses_group", None),
+            unlink_on_cleanup=getattr(vgm, "ulysses_rank", 0) == 0,
+        )
+        return self._shared_offload_storage_config
+
     def offload_context(self, group_name: str, enable: bool = True):
         """Stage an offload group for the duration of an explicit call site."""
         if not enable:
@@ -460,6 +597,7 @@ class BasePipeline(nn.Module):
             parts=available_parts,
             device=self.offload_pipeline_device(requested_parts),
             pin_memory=pin_memory,
+            shared_storage=self.offload_shared_storage_config(stages),
         )
         offload_pipeline.initialize()
         self._offload_pipeline = offload_pipeline
@@ -1139,6 +1277,7 @@ class BasePipeline(nn.Module):
             self._offload_pipeline.cleanup()
             self._offload_pipeline = None
             self._offload_group_name_by_part = {}
+            self._shared_offload_storage_config = None
         for name, runner in self._cuda_graph_runners.items():
             logger.info(f"Releasing CUDA graphs for {name}")
             runner.clear()

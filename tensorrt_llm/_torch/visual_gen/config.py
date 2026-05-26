@@ -353,7 +353,35 @@ class PipelineConfig(StrictBaseModel):
     # Offloading
     enable_offloading: bool = False
     offload_device: Literal["cpu", "cuda"] = "cpu"
-    offload_param_pin_memory: bool = True
+    offload_param_pin_memory: bool = PydanticField(
+        True,
+        description=(
+            "Pin CPU offload storage for faster host-to-device copies. Shared "
+            "memory offload requires this so the file mapping can be CUDA-registered."
+        ),
+    )
+    offload_shared_memory: bool = PydanticField(
+        False,
+        description=(
+            "Use file-backed shared CPU storage for offloaded parameters across "
+            "distributed visual-generation ranks."
+        ),
+    )
+    offload_shared_memory_path: str = PydanticField(
+        "",
+        description=(
+            "Optional backing-file path for shared CPU offload storage. When empty, "
+            "a stable path under /dev/shm or the system temporary directory is used."
+        ),
+    )
+    offload_shared_memory_scope: Literal["ulysses", "numa"] = PydanticField(
+        "ulysses",
+        description=(
+            "Distributed rank scope for shared CPU offload storage: 'ulysses' shares "
+            "within each Ulysses group, while 'numa' creates one shared file per "
+            "detected NUMA group."
+        ),
+    )
     offload_stages: Optional[List[Union[str, List[str]]]] = PydanticField(
         default=None,
         description=(
