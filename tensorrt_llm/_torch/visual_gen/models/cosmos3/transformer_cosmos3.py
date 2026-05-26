@@ -894,29 +894,8 @@ class Cosmos3VFMTransformer(nn.Module):
         """
         T, H, W = video_shape
         Hp, Wp, _, _ = self._pad_to_patch_size(H, W)
-        max_real_len = text_mask.sum(dim=1).max().item()
-
-        hidden_gen = self.vae2llm(self.patchify(hidden_states, T, H, W))
-
-        with torch.autocast("cuda", enabled=True, dtype=torch.float32):
-            time_embed = self.time_embedder((timestep * self.timestep_scale))
-        time_embed = time_embed.to(hidden_states.dtype)
-
-        if noisy_frame_mask is not None:
-            # Build per-token mask from per-frame mask.
-            # noisy_frame_mask: [B, 1, T, 1, 1] → token mask: [B, T*Hp*Wp, 1]
-            noisy_frame_mask = noisy_frame_mask.expand(hidden_gen.shape[0], -1, -1, -1, -1)
-            token_noisy_mask = (
-                noisy_frame_mask[:, 0, :, 0, 0]  # [B, T]
-                .unsqueeze(-1)  # [B, T, 1]
-                .expand(-1, -1, Hp * Wp)  # [B, T, Hp*Wp]
-                .reshape(hidden_gen.shape[0], -1, 1)  # [B, T*Hp*Wp, 1]
-            )
-            hidden_gen = hidden_gen + time_embed.unsqueeze(1) * token_noisy_mask
-        else:
-            hidden_gen = hidden_gen + time_embed.unsqueeze(1)
-
         if self.cached_kv is None:
+            max_real_len = text_mask.sum(dim=1).max().item()
             freqs_und, freqs_gen = self._compute_rope_freqs(
                 text_mask,
                 T,
@@ -957,6 +936,26 @@ class Cosmos3VFMTransformer(nn.Module):
             else:
                 self.cached_kv = cached_kv_full
 
+        text_seq_len = text_mask.shape[1]
+
+        hidden_gen = self.vae2llm(self.patchify(hidden_states, T, H, W))
+
+        with torch.autocast("cuda", enabled=True, dtype=torch.float32):
+            time_embed = self.time_embedder((timestep * self.timestep_scale))
+        time_embed = time_embed.to(hidden_states.dtype)
+
+        if noisy_frame_mask is not None:
+            noisy_frame_mask = noisy_frame_mask.expand(hidden_gen.shape[0], -1, -1, -1, -1)
+            token_noisy_mask = (
+                noisy_frame_mask[:, 0, :, 0, 0]
+                .unsqueeze(-1)
+                .expand(-1, -1, Hp * Wp)
+                .reshape(hidden_gen.shape[0], -1, 1)
+            )
+            hidden_gen = hidden_gen + time_embed.unsqueeze(1) * token_noisy_mask
+        else:
+            hidden_gen = hidden_gen + time_embed.unsqueeze(1)
+
         if self.use_seq_parallel:
             S_gen = hidden_gen.shape[1]
             pad = (self.seq_parallel_size - S_gen % self.seq_parallel_size) % self.seq_parallel_size
@@ -989,8 +988,8 @@ class Cosmos3VFMTransformer(nn.Module):
             for i, layer in enumerate(self.gen_layers):
                 k_und, v_und = self.cached_kv[i]
                 if self.seq_parallel_size <= 1:
-                    k_und = k_und[:, :max_real_len]
-                    v_und = v_und[:, :max_real_len]
+                    k_und = k_und[:, :text_seq_len]
+                    v_und = v_und[:, :text_seq_len]
                 hidden_gen = layer(hidden_gen, k_und, v_und, freqs_gen)
 
         if self.use_seq_parallel:

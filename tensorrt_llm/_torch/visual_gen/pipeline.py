@@ -791,6 +791,10 @@ class BasePipeline(nn.Module):
             "local_extras": local_extras,
         }
 
+    def _sync_for_timing(self) -> None:
+        if getattr(self, "_sync_denoise_timing", False) and torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+
     def _denoise_step_cfg_parallel(
         self,
         latents,
@@ -808,8 +812,10 @@ class BasePipeline(nn.Module):
         cfg_pg = vgm.cfg_group if vgm else None
         cfg_size = vgm.cfg_size if vgm else 1
 
+        self._sync_for_timing()
         t_start = time.time()
         result = forward_fn(latents, extra_stream_latents, timestep, local_embeds, local_extras)
+        self._sync_for_timing()
 
         # Handle return format: (primary_noise, extra_noises_dict) or just primary_noise
         if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict):
@@ -820,6 +826,7 @@ class BasePipeline(nn.Module):
 
         t_transformer = time.time() - t_start
 
+        self._sync_for_timing()
         c_start = time.time()
 
         # All-gather primary noise over the CFG group.
@@ -852,6 +859,7 @@ class BasePipeline(nn.Module):
         if guidance_rescale > 0.0:
             noise_pred = self._rescale_noise_cfg(noise_pred, noise_cond, guidance_rescale)
 
+        self._sync_for_timing()
         t_cfg = time.time() - c_start
         return noise_pred, extra_noise_preds, t_transformer, t_cfg
 
@@ -880,10 +888,12 @@ class BasePipeline(nn.Module):
 
         timestep_expanded = timestep.expand(latent_input.shape[0])
 
+        self._sync_for_timing()
         t_start = time.time()
         result = forward_fn(
             latent_input, extra_stream_input, timestep_expanded, prompt_embeds, local_extras
         )
+        self._sync_for_timing()
 
         # Handle return format: (primary_noise, extra_noises_dict) or just primary_noise
         if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict):
@@ -894,6 +904,7 @@ class BasePipeline(nn.Module):
 
         t_transformer = time.time() - t_start
 
+        self._sync_for_timing()
         c_start = time.time()
         if guidance_scale > 1.0:
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -914,6 +925,7 @@ class BasePipeline(nn.Module):
             if guidance_rescale > 0.0:
                 noise_pred = self._rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale)
 
+            self._sync_for_timing()
             t_cfg = time.time() - c_start
         else:
             t_cfg = 0.0
@@ -932,6 +944,7 @@ class BasePipeline(nn.Module):
         extra_stream_schedulers,
     ):
         """Execute scheduler step for all streams."""
+        self._sync_for_timing()
         t_start = time.time()
         latents = scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
 
@@ -942,6 +955,7 @@ class BasePipeline(nn.Module):
                     noise_extra, timestep, extra_stream_latents[name], return_dict=False
                 )[0]
 
+        self._sync_for_timing()
         t_sched = time.time() - t_start
         return latents, extra_stream_latents, t_sched
 
@@ -1000,12 +1014,21 @@ class BasePipeline(nn.Module):
 
         total_steps = len(timesteps)
         has_extra_streams = extra_streams is not None and len(extra_streams) > 0
+        previous_sync_timing = getattr(self, "_sync_denoise_timing", False)
+        self._sync_denoise_timing = os.environ.get(
+            "TRTLLM_VISUAL_GEN_SYNC_TIMING", "0"
+        ) == "1"
 
         # Reset cache acceleration state for new generation (TeaCache / Cache-DiT)
         if getattr(self, "cache_accelerator", None) and self.cache_accelerator.is_enabled():
             self.cache_accelerator.refresh(total_steps)
 
         if self.rank == 0:
+            if self._sync_denoise_timing:
+                logger.info(
+                    "Synchronized denoise timing enabled "
+                    "(TRTLLM_VISUAL_GEN_SYNC_TIMING=1)."
+                )
             if has_extra_streams:
                 stream_names = ", ".join(["primary"] + list(extra_streams.keys()))
                 logger.info(
@@ -1081,6 +1104,7 @@ class BasePipeline(nn.Module):
 
             if post_step_fn is not None:
                 latents = post_step_fn(latents)
+                self._sync_for_timing()
 
             # Logging
             if self.rank == 0:
@@ -1112,6 +1136,7 @@ class BasePipeline(nn.Module):
                     else:
                         logger.info("Cache acceleration stats: %s", stats)
 
+        self._sync_denoise_timing = previous_sync_timing
         return (latents, extra_stream_latents) if has_extra_streams else latents
 
     def cleanup(self):

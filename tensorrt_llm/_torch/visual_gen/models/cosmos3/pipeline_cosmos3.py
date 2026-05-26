@@ -20,12 +20,14 @@ from typing import List, Optional, Union
 
 import PIL.Image
 import torch
+import torch.nn as nn
 from diffusers import AutoencoderKLWan, UniPCMultistepScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from transformers import Qwen2Tokenizer
 
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
+from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
@@ -91,6 +93,78 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         parts[COSMOS3_LANGUAGE_MODEL_OFFLOAD_STAGE] = self.transformer.language_model
         parts[COSMOS3_GEN_LAYERS_OFFLOAD_STAGE] = self.transformer.gen_layers
         return parts
+
+    def _setup_cuda_graphs(self):
+        """Wrap the transformer forward for CUDA graph replay.
+
+        Cosmos3 runs the understanding pathway once per request before the
+        repeated generator path. The pipeline calls an eager copy of ``forward``
+        for the cache-building step, then uses the wrapped ``forward`` for CUDA
+        graph capture/replay once ``cached_kv`` exists.
+        """
+        if not self.model_config.cuda_graph.enable_cuda_graph:
+            return
+
+        if self.offload_stages():
+            raise NotImplementedError(
+                "CUDA graphs are not supported with visual generation offloading yet. "
+                "Disable either cuda_graph.enable_cuda_graph or pipeline.enable_offloading."
+            )
+
+        if self.transformer is not None and self.transformer.use_seq_parallel:
+            logger.warning(
+                "CUDA graphs for Cosmos3 require ulysses_size=1; skipping CUDA graph setup."
+            )
+            return
+
+        runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
+        compile_note = (
+            " (with torch.compile)"
+            if self.model_config.torch_compile.enable_torch_compile
+            else ""
+        )
+        logger.info(f"CUDA graph runner: wrapping transformer.forward{compile_note}")
+        self.transformer._eager_forward = self.transformer.forward
+        self.transformer.forward = runner.wrap(self.transformer.forward)
+        self._cuda_graph_runners["transformer"] = runner
+
+    def _reset_transformer_cache_for_request(self) -> None:
+        self.transformer.reset_cache()
+        for runner in self._cuda_graph_runners.values():
+            runner.clear()
+
+    def torch_compile(self) -> None:
+        """Compile Cosmos3 gen and understanding block stacks."""
+        if not self.model_config.torch_compile.enable_torch_compile:
+            return
+        if self.transformer is None:
+            return
+
+        tc_config = self.model_config.torch_compile
+        compile_mode = "default"
+        block_targets = (
+            ("transformer", "gen_layers", self.transformer.gen_layers),
+            ("transformer.language_model", "layers", self.transformer.language_model.layers),
+        )
+        for prefix, block_name, blocks in block_targets:
+            logger.info(
+                f"torch.compile: {prefix}.{block_name} "
+                f"({len(blocks)} blocks, mode={compile_mode})"
+            )
+            compiled_blocks = []
+            for block in blocks:
+                compiled_blocks.append(
+                    torch.compile(
+                        block,
+                        mode=compile_mode,
+                        dynamic=None,
+                        fullgraph=tc_config.enable_fullgraph,
+                    )
+                )
+            if block_name == "gen_layers":
+                self.transformer.gen_layers = nn.ModuleList(compiled_blocks)
+            else:
+                self.transformer.language_model.layers = nn.ModuleList(compiled_blocks)
 
     def _make_offload_context_factory(self, stage_name: str):
         requested_parts = self.requested_offload_parts()
@@ -608,7 +682,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             Since Cosmos3 embeds text internally, we pass token IDs via extra_tensors
             rather than through encoder_hidden_states.
             """
-            noise_pred = self.transformer(
+            gen_kwargs = dict(
                 hidden_states=latent_input,
                 timestep=timestep,
                 text_ids=extra_tensors["text_ids"],
@@ -617,6 +691,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 fps=frame_rate,
                 noisy_frame_mask=velocity_mask,
             )
+            if self._cuda_graph_runners and self.transformer.cached_kv is None:
+                noise_pred = self.transformer._eager_forward(**gen_kwargs)
+            else:
+                noise_pred = self.transformer(**gen_kwargs)
             if velocity_mask is not None:
                 noise_pred = noise_pred * velocity_mask
             return noise_pred
@@ -629,7 +707,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             "text_mask": (cond_mask, uncond_mask),
         }
 
-        self.transformer.reset_cache()
+        self._reset_transformer_cache_for_request()
 
         # 6. Denoise
         latents = self.denoise(
