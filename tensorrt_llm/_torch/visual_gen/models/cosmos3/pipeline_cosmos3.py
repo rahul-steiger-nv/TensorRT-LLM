@@ -88,7 +88,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         if self.transformer is None:
             return parts
 
-        parts[COSMOS3_REASONER_OFFLOAD_STAGE] = self.transformer.language_model
         parts[COSMOS3_LANGUAGE_MODEL_OFFLOAD_STAGE] = self.transformer.language_model
         parts[COSMOS3_GEN_LAYERS_OFFLOAD_STAGE] = self.transformer.gen_layers
         return parts
